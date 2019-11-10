@@ -562,7 +562,7 @@ class PathMap(collections.abc.MutableMapping):
         if not node.__isset:
             raise KeyError()
         return node.__value
-    def __setitem__(self, path: bytes, value: Any):
+    def __setitem__(self, path: bytes, value: Any) -> bool:
         nodes = tuple(self.__walk(path, allow_create=True))
         final = nodes[-1]
         final.__value = value
@@ -570,6 +570,9 @@ class PathMap(collections.abc.MutableMapping):
             final.__isset = True
             for node in nodes:
                 node.__len += 1
+            return True
+        else:
+            return False
     def __delitem__(self, path: bytes):
         nodes = tuple(self.__walk(path, allow_create=False, comps=True))
         final, comp = nodes[-1]
@@ -594,24 +597,24 @@ class PathMap(collections.abc.MutableMapping):
             yield self.__syntax.join_paths(*comps)
     def __len__(self):
         return self.__len
-    def set_and_parents(self, path: bytes, value: Any, implicit: Any) -> int:
+    def set_and_parents(self, path: bytes, value: Any, parents: Any) -> Tuple[bool, int]:
         count = 0
         prev_nodes = []
         for node in self.__walk(path, allow_create=True):
             prev_nodes.append(node)
             if not node.__isset:
-                implied = True
+                unset = True
                 count += 1
                 node.__isset = True
-                node.__value = implicit
+                node.__value = parents
                 for n in prev_nodes:
                     n.__len += 1
             else:
-                implied = False
+                unset = False
         node.__value = value
-        if implied:
+        if unset:
             count -= 1
-        return count
+        return unset, count
     def setdefault_and_parents(self, path: bytes, default: Any, parents: Any) -> Tuple[bool, Any, int]:
         count = 0
         prev_nodes = []
@@ -687,6 +690,17 @@ class PathMap(collections.abc.MutableMapping):
             sub_comps.insert(0, comp)
             return sub_comps, value
         return None
+    def setdefault(self, path: bytes, default: Any = None):
+        nodes = tuple(self.__walk(path, allow_create=True))
+        final = nodes[-1]
+        if final.__isset:
+            return final.__value
+        else:
+            final.__isset = True
+            final.__value = default
+            for node in nodes:
+                node.__len += 1
+            return default
     def __iter_key_comps(self) -> Iterator[List[bytes]]:
         if self.__isset:
             yield []
@@ -724,6 +738,8 @@ class PathSet(collections.abc.MutableSet):
         return iter(self.__elems)
     def __len__(self) -> int:
         return len(self.__elems)
+    def add_and_parents(self, path: bytes) -> Tuple[bool, int]:
+        return self.__elems.set_and_parents(path, None, None)
     def clear(self, *args, **kwargs):
         return self.__elems.clear(*args, **kwargs)
     def clear_children(self, *args, **kwargs):
@@ -732,8 +748,8 @@ class PathSet(collections.abc.MutableSet):
         return self.__elems.contains_parent(*args, **kwargs)
     def contains_child(self, *args, **kwargs):
         return self.__elems.contains_child(*args, **kwargs)
-    def add(self, path: bytes):
-        self.__elems.__setitem__(path, None)
+    def add(self, path: bytes) -> bool:
+        return self.__elems.__setitem__(path, None)
     def discard(self, path: bytes):
         try:
             del self.__elems[path]
