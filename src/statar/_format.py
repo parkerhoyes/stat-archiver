@@ -190,6 +190,7 @@ class ArchiveSyntax:
                 continue
             cp = string[pos]
             if cp == self.escape_char[0]:
+                pos += 1
                 branch = self.escape_sequences_lookup_tree
                 for pos in range(pos, len(string)):
                     cp = string[pos]
