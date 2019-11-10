@@ -612,6 +612,26 @@ class PathMap(collections.abc.MutableMapping):
         if implied:
             count -= 1
         return count
+    def setdefault_and_parents(self, path: bytes, default: Any, parents: Any) -> Tuple[bool, Any, int]:
+        count = 0
+        prev_nodes = []
+        for node in self.__walk(path, allow_create=True):
+            prev_nodes.append(node)
+            if not node.__isset:
+                unset = True
+                count += 1
+                node.__isset = True
+                node.__value = parents
+                for n in prev_nodes:
+                    n.__len += 1
+            else:
+                unset = False
+        if unset:
+            node.__value = default
+            count -= 1
+        else:
+            default = node.__value
+        return unset, default, count
     def clear(self, path: bytes = b'.'):
         try:
             for node in self.__walk(path, allow_create=False):

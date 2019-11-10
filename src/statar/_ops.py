@@ -361,11 +361,11 @@ def inspect(parser: _format.RawArchiveParser,
     if parser.syntax != semantics.syntax:
         raise ValueError()
     n_records = 0
-    files = _format.PathMap(syntax=semantics.syntax)
+    n_paths = 0
     n_implicit_dirs = 0
     n_records_by_attr = {attr: 0 for attr in semantics.attrs}
-    ftypes = {ftype: 0 for ftype in _attrs.ATTR_TYPE.TYPES}
     normalized = True
+    files = _format.PathMap(syntax=semantics.syntax)
     prev_path_key = None
     prev_attr_key = None
     for record in parser.read_records():
@@ -379,11 +379,10 @@ def inspect(parser: _format.RawArchiveParser,
         except KeyError:
             raise _sem.ArchiveSemanticsError(f'unrecognized attribute name {name!r}') from None
         n_records += 1
-        try:
-            ftype = files[path]
-        except KeyError:
-            ftype = ArchiveInfo.TYPE_UNKNOWN
-            n_implicit_dirs += files.set_and_parents(path, ftype, _attrs.ATTR_TYPE.TYPE_DIRECTORY)
+        new_path, ftype, implicit_parents = files.setdefault_and_parents(path, ArchiveInfo.TYPE_UNKNOWN, None)
+        if new_path:
+            n_paths += 1
+        n_implicit_dirs += implicit_parents
         if ftype == ArchiveInfo.TYPE_UNKNOWN:
             if attr == _attrs.ATTR_TYPE:
                 ftype = _attrs.ATTR_TYPE.deserialize(b''.join(record))
@@ -418,16 +417,19 @@ def inspect(parser: _format.RawArchiveParser,
         ): normalized = False
         prev_path_key = path_key
         prev_attr_key = attr_key
+    n_paths_by_ftype = {
+        ftype: 0 for ftype in (*_attrs.ATTR_TYPE.TYPES, ArchiveInfo.TYPE_UNKNOWN, ArchiveInfo.TYPE_UNRECOGNIZED)
+    }
+    for ftype in files.values():
+        if ftype is not None:
+            n_paths_by_ftype[ftype] += 1
     return ArchiveInfo(
         semantics,
         n_records=n_records,
-        n_paths=len(files),
+        n_paths=n_paths,
         n_implicit_dirs=n_implicit_dirs,
         n_records_by_attr=n_records_by_attr,
-        n_paths_by_ftype={
-            ftype: sum(1 for path, ft in files.items() if ft == ftype)
-            for ftype in (*_attrs.ATTR_TYPE.TYPES, ArchiveInfo.TYPE_UNKNOWN, ArchiveInfo.TYPE_UNRECOGNIZED)
-        },
+        n_paths_by_ftype=n_paths_by_ftype,
         contains_comments=parser.seen_comments(),
         normalized=normalized,
     )
