@@ -431,21 +431,12 @@ class RawArchiveParser(RawArchiveSource): # concrete
                 return branch
         raise ArchiveFormatError('unexpected EOF')
     def __read_path(self) -> bytes:
-        comps = []
-        while True:
-            comps.append(self.__read_string())
-            if comps[-1] in (b'', '.'):
-                if len(comps) == 1:
-                    return comps[-1]
-                raise ArchiveFormatError('invalid path', line=self.__line)
-            if comps[-1] == '..':
-                raise ArchiveFormatError('invalid path', line=self.__line)
-            cp = self.__read_codepoint()
-            if cp == self.syntax.sep_char[0]:
-                break
-            elif cp != self.syntax.path_sep_char[0]:
-                raise ArchiveFormatError('invalid path syntax', line=self.__line)
-        return self.syntax.path_sep_char.join(comps)
+        path = self.syntax.escape_string(self.__read_string(self.syntax.path_sep_char), self.syntax.path_sep_char)
+        if not self.syntax.validate_path(path):
+            raise ArchiveFormatError('invalid path', line=self.__line)
+        if self.__read_codepoint() != self.syntax.sep_char[0]:
+            raise ArchiveFormatError('invalid path syntax', line=self.__line)
+        return path
     def __read_name(self) -> str:
         name = self.__read_string(self.syntax.path_sep_char)
         if self.__read_codepoint() != self.syntax.sep_char[0]:
