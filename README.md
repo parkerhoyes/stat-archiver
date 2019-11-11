@@ -23,6 +23,10 @@ the following restrictions:
 
 # stat-archiver 0.8.0
 
+[![PyPI](https://img.shields.io/pypi/v/statar?color=blue)](https://pypi.org/project/statar/)
+[![documentation](https://img.shields.io/badge/docs-read%20now-blue)](doc/documentation.md)
+[![develop branch ahead by](https://img.shields.io/github/commits-since/parkerhoyes/stat-archiver/latest/develop?color=red&label=develop%20branch%20ahead%20by)](https://github.com/parkerhoyes/stat-archiver/tree/develop)
+
 stat-archiver (or `statar`) is a command-line utility which can:
 
 - read the file attributes (timestamps, permissions, owner, etc.) of each file
