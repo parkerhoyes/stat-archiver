@@ -21,7 +21,7 @@ the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 -->
 
-# stat-archiver 0.8.0
+# stat-archiver 0.8.1
 
 [![PyPI](https://img.shields.io/pypi/v/statar?color=blue)](https://pypi.org/project/statar/)
 [![documentation](https://img.shields.io/badge/docs-read%20now-blue)](doc/documentation.md)
