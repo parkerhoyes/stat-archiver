@@ -354,7 +354,9 @@ class Application:
             except ValueError:
                 raise ApplicationError(f'invalid target path: {dest_path!r}') from None
             dest_path = prefix / dest_path
-            target_paths[dest_path] = target
+            if not (dest_path in target_paths or (recursive and target_paths.contains_parent(dest_path))):
+                target_paths[dest_path] = target
+        target_paths.sort()
         try:
             with _get_raw_stdout() if output is None else open(output, 'wb') as output:
                 archive = _sem.ArchiveComposer(_util.writer_from_file(output), annotate=annotate)
