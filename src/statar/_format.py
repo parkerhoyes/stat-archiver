@@ -228,14 +228,22 @@ class Path:
         """Deserialize a path in the given syntax.
 
         Raises:
-            ArchiveFormatError: If the syntax of the path is invalid
+            ArchiveFormatError: If the path is invalid
         """
-        try:
-            comps = tuple(
-                syntax.unescape_string(comp).decode('utf-8') for comp in bytes(path).split(syntax.path_sep_char)
-            )
-        except UnicodeError as e:
-            raise ArchiveFormatError('invalid path syntax') from e
+        if path == '':
+            comps = ('',)
+        elif path == b'.':
+            comps = ()
+        else:
+            try:
+                comps = tuple(
+                    syntax.unescape_string(comp).decode('utf-8') for comp in bytes(path).split(syntax.path_sep_char)
+                )
+            except UnicodeError as e:
+                raise ArchiveFormatError('invalid path syntax') from e
+            for comp in comps:
+                if comp in ('', '.', '..'):
+                    raise ArchiveFormatError(f'invalid component in path: {comp!r}')
         return __class__(comps)
     @staticmethod
     def validate(path: bytes, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX) -> bool:
@@ -280,7 +288,7 @@ class Path:
             return False
         return other.__comps == self.__comps
     def __hash__(self) -> int:
-        return hash((__class__.__qualname__, self.__syntax, self.__comps))
+        return hash((__class__.__qualname__, self.__comps))
     def __lt__(self, other) -> bool:
         if other is self:
             return False
@@ -296,6 +304,8 @@ class Path:
             return NotImplemented
         return __class__.join(other, self)
     def serialize(self, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX) -> bytes:
+        if len(self.__comps) == 0:
+            return b'.'
         return syntax.path_sep_char.join(syntax.escape_string(comp.encode('utf-8')) for comp in self.__comps)
     def to_ospath(self) -> str:
         if not self.__valid_os_path:
