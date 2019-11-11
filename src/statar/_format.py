@@ -283,6 +283,106 @@ class ArchiveSyntax:
         return tuple(self.unescape_string(comp).decode('utf-8') for comp in path.split(self.__path_sep_char))
 STANDARD_SYNTAX = ArchiveSyntax()
 
+@functools.total_ordering
+class Path:
+    __slots__ = (
+        '__comps',
+        '__valid_os_path',
+    )
+    @staticmethod
+    def deserialize(path: bytes, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX) -> 'Path':
+        """Deserialize a path in the given syntax.
+
+        Raises:
+            ArchiveFormatError: If the syntax of the path is invalid
+        """
+        try:
+            comps = tuple(
+                syntax.unescape_string(comp).decode('utf-8') for comp in bytes(path).split(syntax.path_sep_char)
+            )
+        except UnicodeError as e:
+            raise ArchiveFormatError('invalid path syntax') from e
+        return __class__(comps)
+    @staticmethod
+    def validate(path: bytes, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX) -> bool:
+        try:
+            __class__.deserialize(path, syntax)
+        except ArchiveFormatError:
+            return False
+        else:
+            return True
+    @staticmethod
+    def from_ospath(path: str) -> 'Path':
+        """Convert an OS path into a ``Path``.
+
+        Raises:
+            ValueError: if the OS path is invalid as a ``Path``
+        """
+        path = str(path)
+        if path == '':
+            comps = ('',)
+        elif path == '.':
+            comps = ()
+        else:
+            comps = path.split(_OS_PATH_SEP_CHAR)
+            if any(comp in ('', '.', '..') for comp in comps):
+                raise ValueError()
+        return __class__(comps)
+    @property
+    def comps(self) -> Tuple[str, ...]:
+        return self.__comps
+    def __init__(self, comps, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__comps = tuple(str(comp) for comp in comps)
+        assert (
+            (len(self.__comps) == 1 and self.__comps[0] == '') or
+            all(comp not in ('', '.', '..') for comp in self.__comps)
+        )
+        self.__valid_os_path = all('\x00' not in comp and _OS_PATH_SEP_CHAR not in comp for comp in self.__comps)
+    def __eq__(self, other) -> bool:
+        if other is self:
+            return True
+        if not isinstance(other, __class__):
+            return False
+        return other.__comps == self.__comps
+    def __hash__(self) -> int:
+        return hash((__class__.__qualname__, self.__syntax, self.__comps))
+    def __lt__(self, other) -> bool:
+        if other is self:
+            return False
+        if not isinstance(other, __class__):
+            return NotImplemented
+        return self.__comps < other.__comps
+    def __truediv__(self, other) -> 'Path':
+        if not isinstance(other, __class__) and not isinstance(other, str):
+            return NotImplemented
+        return self.join(other)
+    def __rtruediv__(self, other) -> 'Path':
+        if not isinstance(other, __class__) and not isinstance(other, str):
+            return NotImplemented
+        return __class__.join(other, self)
+    def serialize(self, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX) -> bytes:
+        return syntax.path_sep_char.join(syntax.escape_string(comp.encode('utf-8')) for comp in self.__comps)
+    def to_ospath(self) -> str:
+        if not self.__valid_os_path:
+            raise OSError('invalid path for this platform')
+        return _OS_PATH_SEP_CHAR.join(self.__comps)
+    def join(*paths: Union['Path', str]) -> 'Path':
+        comps = []
+        for path in paths:
+            if isinstance(path, __class__):
+                if len(path.comps) == 1 and path.comps[0] == '':
+                    comps.clear()
+                comps.extend(path.comps)
+            elif isinstance(path, str):
+                path = str(path)
+                if path == '':
+                    comps.clear()
+                comps.append(path)
+            else:
+                raise ValueError()
+        return __class__(comps)
+
 class RawArchive(metaclass=ABCMeta): # abstract
     @property
     def syntax(self) -> 'ArchiveSyntax':
