@@ -123,9 +123,9 @@ class ArchiveInfo:
             '',
         ))
 
-def getattrs(archive: _sem.ArchiveSink, path: str, attrs: Iterable[Union[str, _attrs.Attribute]], dest_path: bytes, *,
-        recursive: bool, missing: str, exclude: Optional[_util.OSPathMask] = None, exclude_topmost: bool = False,
-        follow_symlinks: bool = False, max_depth: int = _MAX_RECURSION_DEPTH):
+def getattrs(archive: _sem.ArchiveSink, path: str, attrs: Iterable[Union[str, _attrs.Attribute]],
+        dest_path: _format.Path, *, recursive: bool, missing: str, exclude: Optional[_util.OSPathMask] = None,
+        exclude_topmost: bool = False, follow_symlinks: bool = False, max_depth: int = _MAX_RECURSION_DEPTH):
     """Recursively get the attributes ``attrs`` of all files in the directory at path ``path`` and store them in
     ``archive`` under the path ``dest_path``.
 
@@ -154,8 +154,9 @@ def getattrs(archive: _sem.ArchiveSink, path: str, attrs: Iterable[Union[str, _a
     except KeyError as e:
         raise ValueError() from e
     archive.attrs.sort_attrs(attrs)
-    dest_path = bytes(dest_path)
-    assert archive.syntax.validate_path(dest_path)
+    if not isinstance(dest_path, _format.Path):
+        raise TypeError()
+    dest_path = dest_path
     recursive = bool(recursive)
     max_depth = int(max_depth)
     if max_depth < 0:
@@ -190,7 +191,10 @@ def getattrs(archive: _sem.ArchiveSink, path: str, attrs: Iterable[Union[str, _a
             dirents = list(dirents)
         dirents.sort(key=lambda dirent: str(dirent.name))
         for dirent in dirents:
-            entry_path = archive.syntax.join_paths(dest_path, archive.syntax.serialize_path(dirent.name))
+            name = str(dirent.name)
+            if name in ('', '.', '..'):
+                raise OSError(f'invalid file name: {name!r}')
+            entry_path = dest_path / name
             getattrs(archive, dirent.path, attrs, entry_path, recursive=recursive, missing=missing, exclude=exclude,
                     follow_symlinks=follow_symlinks, max_depth=(max_depth - 1))
 
@@ -224,7 +228,7 @@ def setattrs(archive: _sem.ArchiveSource, path: str, *, missing: str, create_mis
         except StopIteration:
             raise ValueError() from None
         attr = archive.attrs[attr]
-        path = str(os.path.join(rootpath, archive.syntax.deserialize_path(source_path)))
+        path = str(os.path.join(rootpath, source_path.to_ospath()))
         if attr.small:
             value = b''.join(record)
             record = iter((value,))
@@ -248,7 +252,7 @@ def setattrs(archive: _sem.ArchiveSource, path: str, *, missing: str, create_mis
                 elif missing == 'ignore':
                     continue
                 elif missing == 'create':
-                    _create_missing(archive, path, source_path, attr, value, parents=create_missing_parents)
+                    _create_missing(archive, path, attr, value, parents=create_missing_parents)
                     info = os.lstat(path)
                 else:
                     raise ValueError()
@@ -266,7 +270,7 @@ def setattrs(archive: _sem.ArchiveSource, path: str, *, missing: str, create_mis
             dirty = _set_common_attrs(path, _util.FileInfo(info), new_info)
             info = new_info
 
-def _create_missing(path: str, source_path: bytes, attr: _attrs.Attribute, value: Any, *, parents: bool):
+def _create_missing(path: str, attr: _attrs.Attribute, value: Any, *, parents: bool):
     if attr == _attrs.ATTR_TYPE:
         assert _attrs.ATTR_TYPE.small
         ftype = value
@@ -365,8 +369,8 @@ def inspect(parser: _format.RawArchiveParser,
     n_implicit_dirs = 0
     n_records_by_attr = {attr: 0 for attr in semantics.attrs}
     normalized = True
-    files = _format.PathMap(syntax=semantics.syntax)
-    prev_path_key = None
+    files = _format.PathMap()
+    prev_path = None
     prev_attr_key = None
     for record in parser.read_records():
         try:
@@ -402,20 +406,19 @@ def inspect(parser: _format.RawArchiveParser,
             if ftype != ArchiveInfo.TYPE_UNKNOWN:
                 files[path] = ftype
         n_records_by_attr[attr] += 1
-        path_key = semantics.syntax.sort_path_key(path)
         attr_key = semantics.attrs.sort_attr_key(name)
         if normalized and (
             attr.key != name or
             parser.seen_comments() or (
-                prev_path_key is not None and (
-                    prev_path_key > path_key or (
-                        prev_path_key == path_key and
+                prev_path is not None and (
+                    prev_path > path or (
+                        prev_path == path and
                         prev_attr_key >= attr_key
                     )
                 )
             )
         ): normalized = False
-        prev_path_key = path_key
+        prev_path = path
         prev_attr_key = attr_key
     n_paths_by_ftype = {
         ftype: 0 for ftype in (*_attrs.ATTR_TYPE.TYPES, ArchiveInfo.TYPE_UNKNOWN, ArchiveInfo.TYPE_UNRECOGNIZED)

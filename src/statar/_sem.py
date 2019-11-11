@@ -75,9 +75,9 @@ class ArchiveSource(Archive): # abstract
         The returned iterator may raise the same exceptions as this method.
 
         Returns:
-            ``None`` if there are no records remaining, or an iterator which yields the record's path, the attribute,
-            then zero or more ``bytes`` objects which, when concatenated together, are the serialized attribute value
-            (which may be improperly formatted)
+            ``None`` if there are no records remaining, or an iterator which yields the record's path as a
+            :class:`_format.Path`, the attribute as a :class:`_attrs.Attribute`, then zero or more ``bytes`` objects
+            which, when concatenated together, are the serialized attribute value (which may be improperly formatted)
         Raises:
             Exception
         """
@@ -98,9 +98,9 @@ class ArchiveSink(Archive): # abstract
         The provided iterator is completely iterated over before this method returns.
 
         Args:
-            record: An iterable which yields the record's path, then the attribute or attribute name, then zero or more
-                    ``bytes`` objects which, when concatenated together, are the serialized attribute value (which MUST
-                    be properly formatted)
+            record: An iterable which yields the record's path as a :class:`_format.Path`, then the attribute or
+                    attribute name, then zero or more ``bytes`` objects which, when concatenated together, are the
+                    serialized attribute value (which MUST be properly formatted)
         Raises:
             Exception
         """
@@ -179,7 +179,7 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.__entries = _format.PathMap(syntax=self.syntax)
+        self.__entries = _format.PathMap()
         self.__entry_sort_key = lambda key, value: self.attrs.sort_attr_key(key)
         self.__entries_iter = None
     def __new_entry(self):
@@ -206,7 +206,6 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
             attr = next(record)
         except StopIteration:
             raise ValueError() from None
-        path = bytes(path)
         attr = self.attrs[attr]
         value = attr.deserialize(b''.join(record))
         try:
@@ -215,16 +214,14 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
             entry = self.__new_entry()
             self.__entries[path] = entry
         entry[attr] = Record(path, attr, value, semantics=self.semantics)
-    def get_record(self, path: bytes, attr: Union[str, _attrs.Attribute]) -> 'Record':
+    def get_record(self, path: _format.Path, attr: Union[str, _attrs.Attribute]) -> 'Record':
         """
         Raises:
             KeyError
         """
-        path = bytes(path)
         attr = self.attrs[attr]
         return self.__records[path][attr] # Possible KeyError x2 intentional
-    def set_record(self, path: bytes, attr: Union[str, _attrs.Attribute], value: Any):
-        path = bytes(path)
+    def set_record(self, path: _format.Path, attr: Union[str, _attrs.Attribute], value: Any):
         attr = self.attrs[attr]
         try:
             entry = self.__entries[path]
@@ -232,7 +229,7 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
             entry = self.__new_entry()
             self.__entries[path] = entry
         entry[attr] = Record(path, attr, value)
-    def iter_records_by_path(self, path: bytes) -> Iterator['Record']:
+    def iter_records_by_path(self, path: _format.Path) -> Iterator['Record']:
         try:
             entry = self.__records[path]
         except KeyError:
@@ -252,7 +249,7 @@ class Record:
     def semantics(self) -> 'ArchiveSemantics':
         return self.__semantics
     @property
-    def path(self) -> bytes:
+    def path(self) -> _format.Path:
         return self.__path
     @property
     def attr(self) -> _attrs.Attribute:
@@ -260,13 +257,15 @@ class Record:
     @property
     def value(self) -> Any:
         return self.__value
-    def __init__(self, path: bytes, attr: _attrs.Attribute, value: Any, *args,
+    def __init__(self, path: _format.Path, attr: _attrs.Attribute, value: Any, *args,
             semantics: 'ArchiveSemantics' = STANDARD_SEMANTICS, **kwargs):
         super().__init__(*args, **kwargs)
         if not isinstance(semantics, ArchiveSemantics):
             raise TypeError()
         self.__semantics = semantics
-        self.__path = bytes(path)
+        if not isinstance(path, _format.Path):
+            raise TypeError()
+        self.__path = path
         if not isinstance(attr, _attrs.Attribute):
             raise TypeError()
         if attr not in self.semantics.attrs:
@@ -292,9 +291,7 @@ class Record:
         if not isinstance(other, __class__):
             return NotImplemented
         if self.__path != other.__path:
-            self_path = self.__semantics.syntax.sort_path_key(self.__path)
-            other_path = self.__semantics.syntax.sort_path_key(other.__path)
-            return self_path < other_path
+            return self.__path < other.__path
         if self.__attr != other.__attr:
             self_attr = self.__semantics.attrs.sort_attr_key(self.__attr)
             other_attr = self.__semantics.attrs.sort_attr_key(other.__attr)

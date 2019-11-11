@@ -207,80 +207,6 @@ class ArchiveSyntax:
                 raise ArchiveFormatError(f'invalid character in string: 0x{hex(cp)[2:].zfill(2)}')
             pos += 1
         return bytes(result)
-    def validate_path(self, path: bytes) -> bool:
-        """Validate a serialized path."""
-        path = bytes(path)
-        if not re.fullmatch(self.__path_regex, path):
-            return False
-        if path in (b'', b'.'):
-            return True
-        for comp in path.split(self.__path_sep_char):
-            try:
-                comp = self.unescape_string(comp)
-            except ArchiveFormatError:
-                return False
-            try:
-                comp = comp.decode('utf-8')
-            except UnicodeDecodeError:
-                return False
-            if comp in (b'', b'.', b'..'):
-                return False
-        return True
-    def serialize_path(self, path: str) -> bytes:
-        """Serialize an OS path.
-
-        Raises:
-            ValueError: If the path is invalid
-        """
-        path = str(path)
-        if path in ('', '.'):
-            return path.encode('utf-8')
-        path = self.__path_sep_char.join(
-            self.escape_string(comp.encode('utf-8')) for comp in path.split(_OS_PATH_SEP_CHAR)
-        )
-        if not self.validate_path(path):
-            raise ValueError('invalid path')
-        return path
-    def deserialize_path(self, path: bytes) -> str:
-        """Deserialize a path into an OS path.
-
-        Raises:
-            ArchiveFormatError
-            OSError: If the path was valid but cannot be used on this platform
-        """
-        path = bytes(path)
-        if path in (b'', b'.'):
-            return path.decode('utf-8')
-        if not self.validate_path(path):
-            raise ArchiveFormatError('invalid path')
-        try:
-            comps = tuple(self.unescape_string(comp).decode('utf-8') for comp in path.split(self.__path_sep_char))
-        except UnicodeError:
-            raise ArchiveFormatError('invalid path: unicode error') from None
-        if any('\x00' in comp or _OS_PATH_SEP_CHAR in comp for comp in comps):
-            raise OSError('invalid path for this platform')
-        return _OS_PATH_SEP_CHAR.join(comps)
-    def join_paths(self, *paths: bytes) -> bytes:
-        """Join serialized paths."""
-        if all(path == b'.' for path in paths):
-            return b'.'
-        paths = tuple(bytes(path) for path in paths)
-        assert all(self.validate_path(path) for path in paths)
-        if len(paths) == 1:
-            return paths[0]
-        if b'' in paths:
-            raise ValueError()
-        return self.__path_sep_char.join(path for path in paths if path != b'.')
-    def split_path(self, path: bytes) -> List[bytes]:
-        if path == b'.':
-            return []
-        return path.split(self.__path_sep_char)
-    def sort_paths(self, paths: List[bytes]):
-        """Sort serialized paths in-place."""
-        paths.sort(key=self.sort_path_key)
-    def sort_path_key(self, path: bytes):
-        path = bytes(path)
-        return tuple(self.unescape_string(comp).decode('utf-8') for comp in path.split(self.__path_sep_char))
 STANDARD_SYNTAX = ArchiveSyntax()
 
 @functools.total_ordering
@@ -401,9 +327,9 @@ class RawArchiveSource(RawArchive): # abstract
         The returned iterator may raise the same exceptions as this method.
 
         Returns:
-            ``None`` if there are no records remaining, or an iterator which yields the record's path, the attribute
-            name, then zero or more ``bytes`` objects which, when concatenated together, are the serialized attribute
-            value (which may be improperly formatted)
+            ``None`` if there are no records remaining, or an iterator which yields the record's path as a
+            :class:`Path`, the attribute name as a string, then zero or more ``bytes`` objects which, when concatenated
+            together, are the serialized attribute value (which may be improperly formatted)
         Raises:
             Exception
         """
@@ -419,9 +345,9 @@ class RawArchiveSink(RawArchive): # abstract
         The provided iterator will be completely iterated over before this method returns.
 
         Args:
-            record: An iterator which yields the record's path, then the attribute name, then zero or more ``bytes``
-                    objects which, when concatenated together, are the serialized attribute value (which may be
-                    improperly formatted)
+            record: An iterator which yields the record's path as a :class:`Path`, then the attribute name as a string,
+                    then zero or more ``bytes`` objects which, when concatenated together, are the serialized attribute
+                    value (which may be improperly formatted)
         Raises:
             Exception
         """
@@ -531,13 +457,33 @@ class RawArchiveParser(RawArchiveSource): # concrete
             if isinstance(branch, int):
                 return branch
         raise ArchiveFormatError('unexpected EOF')
-    def __read_path(self) -> bytes:
-        path = self.syntax.escape_string(self.__read_string(self.syntax.path_sep_char), self.syntax.path_sep_char)
-        if not self.syntax.validate_path(path):
-            raise ArchiveFormatError('invalid path', line=self.__line)
-        if self.__read_codepoint() != self.syntax.sep_char[0]:
+    def __read_path(self) -> 'Path':
+        comps = [self.__read_path_comp()]
+        if comps[0] == '.':
+            comps.clear()
+        elif comps[0] == '..':
+            raise ArchiveFormatError("invalid component in path: '..'", line=self.__line)
+        for cp in self.__read_codepoints():
+            if cp == self.syntax.path_sep_char[0]:
+                comp = self.__read_path_comp()
+                if comp in ('', '.', '..'):
+                    raise ArchiveFormatError(f'invalid component in path: {comp!r}', line=self.__line)
+                comps.append(comp)
+            elif cp == self.syntax.sep_char[0]:
+                break
+            else:
+                raise ArchiveFormatError('invalid path syntax', line=self.__line)
+        else:
             raise ArchiveFormatError('invalid path syntax', line=self.__line)
-        return path
+        if len(comps) > 1 and comps[0] == '':
+            raise ArchiveFormatError('absolute paths not permitted', line=self.__line)
+        return Path(comps)
+    def __read_path_comp(self) -> str:
+        comp = self.__read_string()
+        try:
+            return comp.decode('utf-8')
+        except UnicodeError as e:
+            raise ArchiveFormatError('invalid path component encoding', line=self.__line) from e
     def __read_name(self) -> str:
         name = self.__read_string(self.syntax.path_sep_char)
         if self.__read_codepoint() != self.syntax.sep_char[0]:
@@ -613,7 +559,7 @@ class RawArchiveComposer(RawArchiveSink): # concrete
             name = next(record)
         except StopIteration:
             raise ValueError()
-        self.__write(path)
+        self.__write(path.serialize(self.syntax))
         self.__write(self.syntax.sep_char)
         self.__write(self.syntax.escape_string(name.encode('utf-8'), self.syntax.path_sep_char))
         self.__write(self.syntax.sep_char)
@@ -637,33 +583,27 @@ class RawArchiveComposer(RawArchiveSink): # concrete
         self.__debuffer(0)
 
 class PathMap(collections.abc.MutableMapping):
-    """This class implements a sorted mutable mapping where the keys are serialized paths for a specified syntax."""
+    """This class implements a sorted mutable mapping where the keys are :class:`Path`s."""
     __slots__ = (
-        '__syntax',
-        '__sort_key',
         '__children',
         '__len',
         '__isset',
         '__value',
     )
-    def __init__(self, init=(), *args, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX, _sort_key=None, **kwargs):
+    def __init__(self, init=(), *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not isinstance(syntax, ArchiveSyntax):
-            raise TypeError()
-        self.__syntax = syntax
-        self.__sort_key = _sort_key if _sort_key is not None else lambda key, value: self.__syntax.sort_path_key(key)
-        self.__children = _util.SortableDict(key=self.__sort_key)
+        self.__children = _util.SortableDict()
         self.__len = 0
         self.__isset = False
         for key, value in collections.OrderedDict(init).items():
             self[key] = value
-    def __getitem__(self, path: bytes) -> Any:
+    def __getitem__(self, path: 'Path') -> Any:
         for node in self.__walk(path, allow_create=False):
             pass
         if not node.__isset:
             raise KeyError()
         return node.__value
-    def __setitem__(self, path: bytes, value: Any) -> bool:
+    def __setitem__(self, path: 'Path', value: Any) -> bool:
         nodes = tuple(self.__walk(path, allow_create=True))
         final = nodes[-1]
         final.__value = value
@@ -674,7 +614,7 @@ class PathMap(collections.abc.MutableMapping):
             return True
         else:
             return False
-    def __delitem__(self, path: bytes):
+    def __delitem__(self, path: 'Path'):
         nodes = tuple(self.__walk(path, allow_create=False, comps=True))
         final, comp = nodes[-1]
         if not final.__isset:
@@ -686,19 +626,19 @@ class PathMap(collections.abc.MutableMapping):
         if len(nodes) > 1 and final.__len == 0:
             node, _ = nodes[-2]
             del node.__children[comp]
-    def __contains__(self, path: bytes):
+    def __contains__(self, path: 'Path'):
         try:
             self[path]
         except KeyError:
             return False
         else:
             return True
-    def __iter__(self) -> Iterator[bytes]:
+    def __iter__(self) -> Iterator['Path']:
         for comps in self.__iter_key_comps():
-            yield self.__syntax.join_paths(*comps)
+            yield Path(comps)
     def __len__(self):
         return self.__len
-    def set_and_parents(self, path: bytes, value: Any, parents: Any) -> Tuple[bool, int]:
+    def set_and_parents(self, path: 'Path', value: Any, parents: Any) -> Tuple[bool, int]:
         count = 0
         prev_nodes = []
         for node in self.__walk(path, allow_create=True):
@@ -716,7 +656,7 @@ class PathMap(collections.abc.MutableMapping):
         if unset:
             count -= 1
         return unset, count
-    def setdefault_and_parents(self, path: bytes, default: Any, parents: Any) -> Tuple[bool, Any, int]:
+    def setdefault_and_parents(self, path: 'Path', default: Any, parents: Any) -> Tuple[bool, Any, int]:
         count = 0
         prev_nodes = []
         for node in self.__walk(path, allow_create=True):
@@ -736,7 +676,7 @@ class PathMap(collections.abc.MutableMapping):
         else:
             default = node.__value
         return unset, default, count
-    def clear(self, path: bytes = b'.'):
+    def clear(self, path: 'Path'):
         try:
             for node in self.__walk(path, allow_create=False):
                 pass
@@ -748,7 +688,7 @@ class PathMap(collections.abc.MutableMapping):
         if node.__isset:
             node.__isset = False
             del node.__value
-    def clear_children(self, path: bytes = b'.'):
+    def clear_children(self, path: 'Path'):
         try:
             for node in self.__walk(path, allow_create=False):
                 pass
@@ -757,7 +697,7 @@ class PathMap(collections.abc.MutableMapping):
         # TODO Memory leak: empty nodes are not pruned
         node.__children.clear()
         node.__len = 1 if node.__isset else 0
-    def contains_parent(self, path: bytes) -> bool:
+    def contains_parent(self, path: 'Path') -> bool:
         try:
             for node in self.__walk(path, allow_create=False):
                 if node.__isset:
@@ -765,7 +705,7 @@ class PathMap(collections.abc.MutableMapping):
         except KeyError:
             pass
         return False
-    def contains_child(self, path: bytes) -> bool:
+    def contains_child(self, path: 'Path') -> bool:
         try:
             for node in self.__walk(path, allow_create=False):
                 if len(node) == 0:
@@ -773,13 +713,13 @@ class PathMap(collections.abc.MutableMapping):
         except KeyError:
             return False
         return len(node) > 1 or (len(node) == 1 and not node.__isset)
-    def firstitem(self) -> Tuple[bytes, Any]:
+    def firstitem(self) -> Tuple['Path', Any]:
         item = self.__firstitem()
         if item is None:
             raise KeyError()
         comps, value = item
-        return self.__syntax.join_paths(*comps), value
-    def __firstitem(self) -> Optional[Tuple[List[bytes], Any]]:
+        return Path(comps), value
+    def __firstitem(self) -> Optional[Tuple[List[str], Any]]:
         if self.__isset:
             return [], self.__value
         self.__children.sort()
@@ -791,7 +731,7 @@ class PathMap(collections.abc.MutableMapping):
             sub_comps.insert(0, comp)
             return sub_comps, value
         return None
-    def setdefault(self, path: bytes, default: Any = None):
+    def setdefault(self, path: 'Path', default: Any = None):
         nodes = tuple(self.__walk(path, allow_create=True))
         final = nodes[-1]
         if final.__isset:
@@ -802,7 +742,7 @@ class PathMap(collections.abc.MutableMapping):
             for node in nodes:
                 node.__len += 1
             return default
-    def __iter_key_comps(self) -> Iterator[List[bytes]]:
+    def __iter_key_comps(self) -> Iterator[List[str]]:
         if self.__isset:
             yield []
         self.__children.sort()
@@ -810,14 +750,14 @@ class PathMap(collections.abc.MutableMapping):
             for sub_comps in node.__iter_key_comps():
                 sub_comps.insert(0, comp)
                 yield sub_comps
-    def __walk(self, path: bytes, *, allow_create: bool, comps: bool = False):
+    def __walk(self, path: Path, *, allow_create: bool, comps: bool = False):
         node = self
         yield node if not comps else (node, None)
-        for comp in self.__syntax.split_path(path):
+        for comp in path.comps:
             child = node.__children.get(comp)
             if child is None:
                 if allow_create:
-                    child = __class__(syntax=self.__syntax, _sort_key=self.__sort_key)
+                    child = __class__()
                     node.__children[comp] = child
                 else:
                     raise KeyError()
@@ -825,21 +765,21 @@ class PathMap(collections.abc.MutableMapping):
             yield node if not comps else (node, comp)
 
 class PathSet(collections.abc.MutableSet):
-    """This class implements a mutable set of serialized paths for a specified syntax."""
+    """This class implements a mutable set of :class:`Path`s."""
     @property
     def proxy(self) -> collections.abc.Set:
         return self.__elems.keys()
-    def __init__(self, init=(), *args, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX, **kwargs):
+    def __init__(self, init=(), *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.__elems = PathMap(syntax=syntax)
+        self.__elems = PathMap()
         self |= init
-    def __contains__(self, path: bytes) -> bool:
+    def __contains__(self, path: 'Path') -> bool:
         return path in self.__elems
-    def __iter__(self) -> Iterator[bytes]:
+    def __iter__(self) -> Iterator['Path']:
         return iter(self.__elems)
     def __len__(self) -> int:
         return len(self.__elems)
-    def add_and_parents(self, path: bytes) -> Tuple[bool, int]:
+    def add_and_parents(self, path: 'Path') -> Tuple[bool, int]:
         return self.__elems.set_and_parents(path, None, None)
     def clear(self, *args, **kwargs):
         return self.__elems.clear(*args, **kwargs)
@@ -849,18 +789,18 @@ class PathSet(collections.abc.MutableSet):
         return self.__elems.contains_parent(*args, **kwargs)
     def contains_child(self, *args, **kwargs):
         return self.__elems.contains_child(*args, **kwargs)
-    def add(self, path: bytes) -> bool:
+    def add(self, path: 'Path') -> bool:
         return self.__elems.__setitem__(path, None)
-    def discard(self, path: bytes):
+    def discard(self, path: 'Path'):
         try:
             del self.__elems[path]
         except KeyError:
             pass
-    def remove(self, path: bytes):
+    def remove(self, path: 'Path'):
         del self.__elems[path] # Possible KeyError intentional
 
 class PathMask:
-    """This class implements a mask of serialized paths for a specified syntax.
+    """This class implements a mask of :class:`Path`s.
 
     Paths may be masked recursively and non-recursively.
     """
@@ -870,27 +810,23 @@ class PathMask:
     @property
     def rmasked(self) -> collections.abc.Set:
         return self.__rmasked.proxy
-    def __init__(self, masked: Iterable[bytes] = (), rmasked: Iterable[bytes] = (), *args,
-            syntax: 'ArchiveSyntax' = STANDARD_SYNTAX, **kwargs):
+    def __init__(self, masked: Iterable['Path'] = (), rmasked: Iterable['Path'] = (), *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not isinstance(syntax, ArchiveSyntax):
-            raise TypeError()
-        self.__syntax = syntax
         self.__rmasked = PathSet()
         for path in rmasked:
-            path = bytes(path)
-            assert self.__syntax.validate_path(path)
+            if not isinstance(path, Path):
+                raise TypeError()
             if self.__rmasked.contains_parent(path):
                 continue
             self.__rmasked.add(path)
         self.__masked = PathSet()
         for path in masked:
-            path = bytes(path)
-            assert self.__syntax.validate_path(path)
+            if not isinstance(path, Path):
+                raise TypeError()
             if self.__rmasked.contains_parent(path):
                 continue
             self.__masked.add(path)
-    def __contains__(self, path: bytes) -> bool:
-        path = bytes(path)
-        assert self.__syntax.validate_path(path)
+    def __contains__(self, path: 'Path') -> bool:
+        if not isinstance(path, Path):
+            raise TypeError()
         return path in self.__masked or self.__rmasked.contains_parent(path)
