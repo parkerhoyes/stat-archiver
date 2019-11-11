@@ -180,10 +180,7 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.__entries = _format.PathMap()
-        self.__entry_sort_key = lambda key, value: self.attrs.sort_attr_key(key)
         self.__entries_iter = None
-    def __new_entry(self):
-        return _util.SortableDict(key=self.__entry_sort_key)
     def read_record(self) -> Optional[Iterator]:
         """
         Raises:
@@ -211,7 +208,7 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
         try:
             entry = self.__entries[path]
         except KeyError:
-            entry = self.__new_entry()
+            entry = _util.SortableDict()
             self.__entries[path] = entry
         entry[attr] = Record(path, attr, value, semantics=self.semantics)
     def get_record(self, path: _format.Path, attr: Union[str, _attrs.Attribute]) -> 'Record':
@@ -226,7 +223,7 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
         try:
             entry = self.__entries[path]
         except KeyError:
-            entry = self.__new_entry()
+            entry = _util.SortableDict()
             self.__entries[path] = entry
         entry[attr] = Record(path, attr, value)
     def iter_records_by_path(self, path: _format.Path) -> Iterator['Record']:
@@ -293,9 +290,7 @@ class Record:
         if self.__path != other.__path:
             return self.__path < other.__path
         if self.__attr != other.__attr:
-            self_attr = self.__semantics.attrs.sort_attr_key(self.__attr)
-            other_attr = self.__semantics.attrs.sort_attr_key(other.__attr)
-            return self_attr < other_attr
+            return self.__attr < other.__attr
         if self.__value != other.__value:
             self_value = self.__attr.serialize(self.__value)
             other_value = other.__attr.serialize(other.__value)

@@ -23,6 +23,7 @@
 
 from abc import ABCMeta, abstractmethod
 import fractions
+import functools
 import hashlib
 import os
 import re
@@ -41,6 +42,7 @@ class AttributeFormatError(_core.ArchiveParsingError):
 class AttributeNotApplicableError(_core.StatArchiverError):
     pass
 
+@functools.total_ordering
 class Attribute(metaclass=ABCMeta):
     @property
     def key(self) -> str:
@@ -73,6 +75,34 @@ class Attribute(metaclass=ABCMeta):
         self.__may_use_fs = bool(may_use_fs)
         self.__priority = int(priority)
         self.__small = bool(small)
+        self.__hash = hash((__class__.__qualname__, self.__key, self.__aliases, self.__may_use_fs, self.__priority,
+                self.__small))
+    def __eq__(self, other):
+        if other is self:
+            return True
+        if not isinstance(other, __class__):
+            return False
+        if other.__key != self.__key:
+            return False
+        if other.__aliases != self.__aliases:
+            return False
+        if other.__may_use_fs != self.__may_use_fs:
+            return False
+        if other.__priority != self.__priority:
+            return False
+        if other.__small != self.__small:
+            return False
+        return True
+    def __hash__(self):
+        return self.__hash
+    def __lt__(self, other):
+        if other is self:
+            return False
+        if not isinstance(other, __class__):
+            return NotImplemented
+        if self.__priority != other.__priority:
+            return self.__priority > other.__priority
+        return self.__key < other.__key
     @abstractmethod
     def serialize(self, value: Any) -> bytes:
         """This method is the inverse of :meth:`deserialize`.
@@ -235,13 +265,6 @@ class AttributeSet:
         return iter(self.__attrs)
     def __contains__(self, item: 'Attribute'):
         return item in self.__attrs
-    def sort_attrs(self, attrs: List[Union[str, 'Attribute']]):
-        attrs.sort(key=self.sort_attr_key)
-    def sort_attr_key(self, attr: Union[str, 'Attribute']) -> Any:
-        name = attr if isinstance(attr, Attribute) else str(attr)
-        attr = self[name]
-        name = attr.key if isinstance(name, Attribute) else name
-        return -attr.priority, attr.key, name
 
 STANDARD_ATTRS = []
 

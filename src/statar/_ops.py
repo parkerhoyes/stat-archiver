@@ -72,7 +72,7 @@ class ArchiveInfo:
     def n_files(self) -> int:
         return self.__n_paths + self.__n_implicit_dirs
     @property
-    def attrs(self) -> Tuple[str, ...]:
+    def attrs(self) -> Tuple[_attrs.Attribute, ...]:
         return self.__attrs
     def __init__(self, semantics: _sem.ArchiveSemantics, *args, n_records, n_paths, n_implicit_dirs,
             n_records_by_attr, n_paths_by_ftype, contains_comments, normalized, **kwargs):
@@ -83,16 +83,14 @@ class ArchiveInfo:
         self.__n_records = int(n_records)
         self.__n_paths = int(n_paths)
         self.__n_implicit_dirs = int(n_implicit_dirs)
+        self.__n_records_by_attr = dict(n_records_by_attr)
         self.__n_records_by_attr = types.MappingProxyType({
-            semantics.attrs[attr]: value for attr, value in dict(n_records_by_attr).items()
+            attr: self.__n_records_by_attr[attr] for attr in semantics.attrs
         })
         self.__n_paths_by_ftype = types.MappingProxyType(dict(n_paths_by_ftype))
         self.__contains_comments = bool(contains_comments)
         self.__normalized = bool(normalized)
-        self.__attrs = tuple(sorted(
-            frozenset(attr for attr, value in self.__n_records_by_attr.items() if value != 0),
-            key=self.__semantics.attrs.sort_attr_key,
-        ))
+        self.__attrs = tuple(sorted(attr for attr, value in self.__n_records_by_attr.items() if value != 0))
     def pretty(self) -> str:
         indent = ' ' * 4
         return '\n'.join((
@@ -153,7 +151,7 @@ def getattrs(archive: _sem.ArchiveSink, path: str, attrs: Iterable[Union[str, _a
         attrs = [archive.attrs[attr] for attr in attrs]
     except KeyError as e:
         raise ValueError() from e
-    archive.attrs.sort_attrs(attrs)
+    attrs.sort()
     if not isinstance(dest_path, _format.Path):
         raise TypeError()
     dest_path = dest_path
@@ -371,7 +369,7 @@ def inspect(parser: _format.RawArchiveParser,
     normalized = True
     files = _format.PathMap()
     prev_path = None
-    prev_attr_key = None
+    prev_attr = None
     for record in parser.read_records():
         try:
             path = next(record)
@@ -406,20 +404,19 @@ def inspect(parser: _format.RawArchiveParser,
             if ftype != ArchiveInfo.TYPE_UNKNOWN:
                 files[path] = ftype
         n_records_by_attr[attr] += 1
-        attr_key = semantics.attrs.sort_attr_key(name)
         if normalized and (
             attr.key != name or
             parser.seen_comments() or (
                 prev_path is not None and (
                     prev_path > path or (
                         prev_path == path and
-                        prev_attr_key >= attr_key
+                        prev_attr >= attr
                     )
                 )
             )
         ): normalized = False
         prev_path = path
-        prev_attr_key = attr_key
+        prev_attr = attr
     n_paths_by_ftype = {
         ftype: 0 for ftype in (*_attrs.ATTR_TYPE.TYPES, ArchiveInfo.TYPE_UNKNOWN, ArchiveInfo.TYPE_UNRECOGNIZED)
     }
