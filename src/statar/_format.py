@@ -739,23 +739,24 @@ class PathMap(collections.abc.MutableMapping):
         except KeyError:
             return False
         return len(node) > 1 or (len(node) == 1 and not node.__isset)
-    def firstitem(self) -> Tuple['Path', Any]:
-        item = self.__firstitem()
-        if item is None:
-            raise KeyError()
-        comps, value = item
-        return Path(comps), value
-    def __firstitem(self) -> Optional[Tuple[List[str], Any]]:
+    def walkitems(self) -> Generator[Tuple['Path', Any], bool, None]:
+        gen = self.__walkitems()
+        for comps, value in gen:
+            gen.send((yield Path(comps), value))
+            yield
+    def __walkitems(self):
         if self.__isset:
-            return [], self.__value
-        for comp, node in self.__children.items():
-            item = node.__firstitem()
-            if item is None:
-                continue
-            sub_comps, value = item
-            sub_comps.insert(0, comp)
-            return sub_comps, value
-        return None
+            # TODO Memory leak: empty nodes are not deleted
+            if (yield [], self.__value):
+                self.__isset = False
+                del self.__value
+            yield
+        for comp, node in self.__children.iteritems():
+            subwalker = node.__walkitems()
+            for subcomps, value in subwalker:
+                subcomps.insert(0, comp)
+                subwalker.send((yield subcomps, value))
+                yield
     def setdefault(self, path: 'Path', default: Any = None):
         nodes = tuple(self.__walk(path, allow_create=True))
         final = nodes[-1]

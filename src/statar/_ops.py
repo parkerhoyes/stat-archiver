@@ -342,8 +342,7 @@ def process(sources: Iterable[_sem.ArchiveSource], sink: _sem.ArchiveSink, *, so
                 continue
             if filter_attrs is not None and attr in filter_attrs:
                 continue
-            if attr not in buff.attrs:
-                raise ValueError()
+            assert attr in buff.attrs
             buff.write_record(itertools.chain((path, attr), record))
     if sort:
         buff.sort()

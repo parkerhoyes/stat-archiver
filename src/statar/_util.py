@@ -64,6 +64,8 @@ class SortableDict(collections.abc.MutableMapping):
             yield k
     def __len__(self):
         return len(self.__entries)
+    def iteritems(self) -> Iterator[Tuple[Any, Any]]:
+        return iter(self.__entries)
     def getitem_by_index(self, index: int) -> Tuple[Any, Any]:
         return self.__entries[index] # Possible IndexError intentional
     def popitem(self, last: bool = True) -> Tuple[Any, Any]:

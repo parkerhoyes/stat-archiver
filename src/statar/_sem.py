@@ -181,17 +181,25 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.__entries = _format.PathMap()
-        self.__entries_iter = None
+        self.__current_entry = None
+        self.__entries_walker = None # The generator is cached to improve performance
     def read_record(self) -> Optional[Iterator]:
         """
         Raises:
         """
-        if len(self.__entries) == 0:
-            return None
-        path, entry = self.__entries.firstitem()
+        if self.__current_entry is None:
+            if self.__entries_walker is None:
+                self.__entries_walker = self.__entries.walkitems()
+            try:
+                self.__current_entry = next(self.__entries_walker)
+            except StopIteration:
+                self.__entries_walker = None
+                return None
+        path, entry = self.__current_entry
         attr, record = entry.popitem(last=False)
         if len(entry) == 0:
-            del self.__entries[path]
+            self.__entries_walker.send(True)
+            self.__current_entry = None
         return iter((path, attr, attr.serialize(record.value)))
     def write_record(self, record: Iterator):
         """
@@ -209,21 +217,25 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
             entry = self.__entries[path]
         except KeyError:
             entry = _util.SortableDict()
+            self.__current_entry = None
+            self.__entries_walker = None
             self.__entries[path] = entry
-        entry[attr] = Record(path, attr, value, semantics=self.semantics)
+        entry[attr] = Record(path, attr, value)
     def get_record(self, path: _format.Path, attr: Union[str, _attrs.Attribute]) -> 'Record':
         """
         Raises:
             KeyError
         """
         attr = self.attrs[attr]
-        return self.__records[path][attr] # Possible KeyError x2 intentional
+        return self.__entries[path][attr] # Possible KeyError x2 intentional
     def set_record(self, path: _format.Path, attr: Union[str, _attrs.Attribute], value: Any):
         attr = self.attrs[attr]
         try:
             entry = self.__entries[path]
         except KeyError:
             entry = _util.SortableDict()
+            self.__current_entry = None
+            self.__entries_walker = None
             self.__entries[path] = entry
         entry[attr] = Record(path, attr, value)
     def iter_records_by_path(self, path: _format.Path) -> Iterator['Record']:
@@ -240,15 +252,11 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
 @functools.total_ordering
 class Record:
     __slots__ = (
-        '__semantics',
         '__path',
         '__attr',
         '__value',
         '__hash',
     )
-    @property
-    def semantics(self) -> 'ArchiveSemantics':
-        return self.__semantics
     @property
     def path(self) -> _format.Path:
         return self.__path
@@ -258,22 +266,14 @@ class Record:
     @property
     def value(self) -> Any:
         return self.__value
-    def __init__(self, path: _format.Path, attr: _attrs.Attribute, value: Any, *args,
-            semantics: 'ArchiveSemantics' = STANDARD_SEMANTICS, **kwargs):
+    def __init__(self, path: _format.Path, attr: _attrs.Attribute, value: Any, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not isinstance(semantics, ArchiveSemantics):
-            raise TypeError()
-        self.__semantics = semantics
-        if not isinstance(path, _format.Path):
-            raise TypeError()
+        assert isinstance(path, _format.Path)
         self.__path = path
-        if not isinstance(attr, _attrs.Attribute):
-            raise TypeError()
-        if attr not in self.semantics.attrs:
-            raise ValueError()
+        assert isinstance(attr, _attrs.Attribute)
         self.__attr = attr
         self.__value = value
-        self.__hash = None
+        self.__hash = hash((__class__.__qualname__, self.__path, self.__attr, self.__value))
     def __eq__(self, other):
         if not isinstance(other, __class__):
             return False
@@ -285,10 +285,10 @@ class Record:
             return False
         return True
     def __hash__(self):
-        if self.__hash is None:
-            self.__hash = hash((__class__.__qualname__, self.__path, self.__attr.key, self.__value))
         return self.__hash
     def __lt__(self, other):
+        if other is self:
+            return False
         if not isinstance(other, __class__):
             return NotImplemented
         if self.__path != other.__path:
