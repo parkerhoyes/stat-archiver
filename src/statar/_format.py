@@ -34,6 +34,9 @@ from . import _util
 _OS_PATH_SEP_CHAR = str(os.path.sep)
 assert len(_OS_PATH_SEP_CHAR) == 1
 
+_HEX_CHARS = b'0123456789abcdef'
+_HEX_LOOKUP = {hi: {lo: bytes.fromhex(bytes((hi, lo)).decode())[0] for lo in _HEX_CHARS} for hi in _HEX_CHARS}
+
 class ArchiveFormatError(_core.ArchiveParsingError):
     def __init__(self, *args, line: Optional[int] = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -62,11 +65,14 @@ class ArchiveSyntax:
     def special_chars(self) -> bytes:
         return self.__special_chars
     @property
-    def escape_sequences(self) -> Mapping[int, bytes]:
-        return self.__escape_sequences
+    def escape_seqs_pattern(self) -> 're.Pattern':
+        return self.__escape_seqs_pattern
     @property
-    def escape_sequences_lookup_tree(self) -> Mapping[int, Union[Mapping, int]]:
-        return self.__escape_sequences_lookup_tree
+    def escape_seqs(self) -> Mapping[int, bytes]:
+        return self.__escape_seqs
+    @property
+    def escape_seqs_lookup_tree(self) -> Mapping[int, Union[Mapping, int]]:
+        return self.__escape_seqs_lookup_tree
     def __init__(self, *args, sep_char: bytes = b':', comment_char: bytes = b'#', path_sep_char: bytes = b'/',
             escape_char: bytes = b'\\', special_chars: bytes = b'', **kwargs):
         super().__init__(*args, **kwargs)
@@ -93,7 +99,9 @@ class ArchiveSyntax:
                 raise ValueError(f'invalid special character: 0x{hex(cp)[2:].zfill(2)}')
         self.__hash = hash((__class__.__qualname__, self.__sep_char, self.__comment_char, self.__path_sep_char,
                 self.__escape_char, self.__special_chars))
-        self.__escape_sequences = {
+        self.__escape_seq_regex = re.escape(self.__escape_char) + b'([0abtnvfr\\]|x[0-9a-f]{2})'
+        self.__escape_seqs_pattern = re.compile(b'(' + self.__escape_seq_regex + b')*')
+        self.__escape_seqs = {
             **{cp: b'x' + hex(cp)[2:].lower().zfill(2).encode() for cp in range(0x00, 0x100)},
             0x00: b'0',
             0x07: b'a',
@@ -105,9 +113,9 @@ class ArchiveSyntax:
             0x0d: b'r',
             ord('\\'): b'\\',
         }
-        self.__escape_sequences_lookup_tree = {}
-        for cp, seq in self.__escape_sequences.items():
-            branch = self.__escape_sequences_lookup_tree
+        self.__escape_seqs_lookup_tree = {}
+        for cp, seq in self.__escape_seqs.items():
+            branch = self.__escape_seqs_lookup_tree
             for seq_cp, next_seq_cp in zip(seq, (*seq[1:], None)):
                 if next_seq_cp is None:
                     branch[seq_cp] = cp
@@ -138,9 +146,6 @@ class ArchiveSyntax:
         return True
     def __hash__(self):
         return self.__hash
-    def __string_regex(self, permitted_special_chars: bytes = b'') -> bytes:
-        return (b'((' + self.string_char_regex(permitted_special_chars) + b')|(' + re.escape(self.__escape_char) +
-                b'([0abtnvfr\\]|x[0-9a-f]{2})))*')
     @functools.lru_cache()
     def string_char_regex(self, permitted_special_chars: bytes = b'') -> bytes:
         return b'[' + re.escape(self.string_chars(permitted_special_chars)) + b']'
@@ -162,6 +167,9 @@ class ArchiveSyntax:
             cp for cp in __class__.TEXT_CHARS
             if cp not in self.__special_chars or cp in permitted_special_chars
         ))
+    def __string_regex(self, permitted_special_chars: bytes = b'') -> bytes:
+        return (b'((' + self.string_char_regex(permitted_special_chars) + b')|(' + re.escape(self.__escape_char) +
+                b'(' + self.__escape_seq_regex + b')))*')
     def escape_string(self, string: bytes, permitted_special_chars: bytes = b'') -> bytes:
         """Eescape characters in ``string`` as necessary."""
         result = bytearray()
@@ -171,7 +179,7 @@ class ArchiveSyntax:
                 result.append(cp)
             else:
                 result.extend(self.escape_char)
-                result.extend(self.escape_sequences[cp])
+                result.extend(self.escape_seqs[cp])
         return bytes(result)
     def unescape_string(self, string: bytes, permitted_special_chars: bytes = b'') -> bytes:
         """Unescape characters in ``string`` as necessary.
@@ -191,7 +199,7 @@ class ArchiveSyntax:
             cp = string[pos]
             if cp == self.escape_char[0]:
                 pos += 1
-                branch = self.escape_sequences_lookup_tree
+                branch = self.escape_seqs_lookup_tree
                 for pos in range(pos, len(string)):
                     cp = string[pos]
                     try:
@@ -398,14 +406,14 @@ class RawArchiveParser(RawArchiveSource): # concrete
         Raises:
             Exception: If raised by source
         """
-        return not self.__ensure()
+        return len(self.__buff) - self.__buff_pos == 0 and not self.__enbuffer()
     def __read_codepoint(self) -> int:
         """
         Raises:
             ArchiveFormatError: If at EOF or raised by source
             Exception: If raised by source
         """
-        if not self.__ensure():
+        if len(self.__buff) - self.__buff_pos == 0 and not self.__enbuffer():
             raise ArchiveFormatError('unexpected EOF')
         cp = self.__buff[self.__buff_pos]
         self.__buff_pos += 1
@@ -416,47 +424,53 @@ class RawArchiveParser(RawArchiveSource): # concrete
             ArchiveFormatError: If at EOF or raised by source
             Exception: If raised by source
         """
-        if not self.__ensure():
+        if len(self.__buff) - self.__buff_pos == 0 and not self.__enbuffer():
             raise ArchiveFormatError('unexpected EOF')
         return self.__buff[self.__buff_pos]
     def __read_codepoints(self) -> Iterator[int]:
-        while self.__ensure():
-            yield self.__read_codepoint()
+        while len(self.__buff) - self.__buff_pos != 0 or self.__enbuffer():
+            cp = self.__buff[self.__buff_pos]
+            self.__buff_pos += 1
+            yield cp
     def __peek_codepoints(self) -> Iterator[int]:
-        while self.__ensure():
-            yield self.__peek_codepoint()
+        while len(self.__buff) - self.__buff_pos != 0 or self.__enbuffer():
+            yield self.__buff[self.__buff_pos]
     def __read_string(self, permitted_special_chars: bytes = b'') -> bytes:
-        return bytes(self.__read_string_codepoints(permitted_special_chars))
-    def __read_string_codepoints(self, permitted_special_chars: bytes = b'') -> Iterator[int]:
-        lookup = self.syntax.is_string_codepoint_lookup_table(permitted_special_chars)
-        while True:
-            l = len(self.__buff)
-            while self.__buff_pos != l:
-                cp = self.__buff[self.__buff_pos]
-                if not lookup[cp]:
-                    break
-                self.__buff_pos += 1
-                yield cp
-            else:
-                if self.__ensure():
+        return b''.join(self.__read_string_blocks(permitted_special_chars))
+    def __read_string_blocks(self, permitted_special_chars: bytes = b'') -> Iterator[bytes]:
+        chars_pattern = self.syntax.string_chars_pattern(permitted_special_chars)
+        while len(self.__buff) - self.__buff_pos != 0 or self.__enbuffer():
+            chars = chars_pattern.match(self.__buff, self.__buff_pos).group(0)
+            if len(chars) != 0:
+                start = self.__buff_pos
+                self.__buff_pos += len(chars)
+                yield self.__buff[start:self.__buff_pos]
+                if self.__buff_pos == len(self.__buff):
                     continue
-                else:
-                    break
-            if cp == self.syntax.escape_char[0]:
-                self.__buff_pos += 1
-                yield self.__read_escape_sequence()
-            else:
+            cp = self.__buff[self.__buff_pos]
+            if cp != self.syntax.escape_char[0]:
                 break
-    def __read_escape_sequence(self) -> int:
-        branch = self.syntax.escape_sequences_lookup_tree
-        for cp in self.__read_codepoints():
-            try:
-                branch = branch[cp]
-            except KeyError:
-                raise ArchiveFormatError('invalid escape sequence', line=self.__line)
-            if isinstance(branch, int):
-                return branch
-        raise ArchiveFormatError('unexpected EOF')
+            charbuff = bytearray(1)
+            if len(self.__buff) - self.__buff_pos < 2 and not self.__ensure(2):
+                raise ArchiveFormatError('unexpected EOF', line=self.__line)
+            esc_cp = self.__buff[self.__buff_pos + 1]
+            if esc_cp == ord('x'):
+                if len(self.__buff) - self.__buff_pos < 4 and not self.__ensure(4):
+                    raise ArchiveFormatError('unexpected EOF', line=self.__line)
+                hi = self.__buff[self.__buff_pos + 2]
+                lo = self.__buff[self.__buff_pos + 3]
+                try:
+                    charbuff[0] = _HEX_LOOKUP[hi][lo]
+                except KeyError:
+                    raise ArchiveFormatError('invalid escape sequence', line=self.__line) from None
+                self.__buff_pos += 4
+            else:
+                try:
+                    charbuff[0] = self.syntax.escape_seqs_lookup_tree[esc_cp]
+                except KeyError:
+                    raise ArchiveFormatError('invalid escape sequence', line=self.__line) from None
+                self.__buff_pos += 2
+            yield charbuff
     def __read_path(self) -> 'Path':
         comps = [self.__read_path_comp()]
         if comps[0] == '.':
@@ -488,7 +502,10 @@ class RawArchiveParser(RawArchiveSource): # concrete
         name = self.__read_string(self.syntax.path_sep_char)
         if self.__read_codepoint() != self.syntax.sep_char[0]:
             raise ArchiveFormatError('invalid attribute name syntax', line=self.__line)
-        return name.decode('utf-8')
+        try:
+            return name.decode('utf-8')
+        except UnicodeError as e:
+            raise ArchiveFormatError('invalid attribute name encoding', line=self.__line) from e
     def __read_comment(self):
         if not self.__at_end() and self.__peek_codepoint() == self.syntax.comment_char[0]:
             self.__seen_comments = True
@@ -511,8 +528,7 @@ class RawArchiveParser(RawArchiveSource): # concrete
     def __read_record_blocks(self) -> Iterator:
         yield self.__read_path()
         yield self.__read_name()
-        yield from _util.buffered_iter(self.__read_string_codepoints(self.syntax.sep_char + self.syntax.path_sep_char),
-                source_bytes=True)
+        yield from _util.buffered_iter(self.__read_string_blocks(self.syntax.sep_char + self.syntax.path_sep_char))
         self.__read_comment()
         if self.__read_codepoint() != ord('\n'):
             raise ArchiveFormatError('expected LF at end of record', line=self.__line)
