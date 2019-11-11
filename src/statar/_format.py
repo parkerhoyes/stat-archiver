@@ -34,6 +34,9 @@ from . import _util
 _OS_PATH_SEP_CHAR = str(os.path.sep)
 assert len(_OS_PATH_SEP_CHAR) == 1
 
+_HEX_CHARS = b'0123456789abcdef'
+_HEX_LOOKUP = {hi: {lo: bytes.fromhex(bytes((hi, lo)).decode())[0] for lo in _HEX_CHARS} for hi in _HEX_CHARS}
+
 class ArchiveFormatError(_core.ArchiveParsingError):
     def __init__(self, *args, line: Optional[int] = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -62,11 +65,14 @@ class ArchiveSyntax:
     def special_chars(self) -> bytes:
         return self.__special_chars
     @property
-    def escape_sequences(self) -> Mapping[int, bytes]:
-        return self.__escape_sequences
+    def escape_seqs_pattern(self) -> 're.Pattern':
+        return self.__escape_seqs_pattern
     @property
-    def escape_sequences_lookup_tree(self) -> Mapping[int, Union[Mapping, int]]:
-        return self.__escape_sequences_lookup_tree
+    def escape_seqs(self) -> Mapping[int, bytes]:
+        return self.__escape_seqs
+    @property
+    def escape_seqs_lookup_tree(self) -> Mapping[int, Union[Mapping, int]]:
+        return self.__escape_seqs_lookup_tree
     def __init__(self, *args, sep_char: bytes = b':', comment_char: bytes = b'#', path_sep_char: bytes = b'/',
             escape_char: bytes = b'\\', special_chars: bytes = b'', **kwargs):
         super().__init__(*args, **kwargs)
@@ -93,7 +99,9 @@ class ArchiveSyntax:
                 raise ValueError(f'invalid special character: 0x{hex(cp)[2:].zfill(2)}')
         self.__hash = hash((__class__.__qualname__, self.__sep_char, self.__comment_char, self.__path_sep_char,
                 self.__escape_char, self.__special_chars))
-        self.__escape_sequences = {
+        self.__escape_seq_regex = re.escape(self.__escape_char) + b'([0abtnvfr\\]|x[0-9a-f]{2})'
+        self.__escape_seqs_pattern = re.compile(b'(' + self.__escape_seq_regex + b')*')
+        self.__escape_seqs = {
             **{cp: b'x' + hex(cp)[2:].lower().zfill(2).encode() for cp in range(0x00, 0x100)},
             0x00: b'0',
             0x07: b'a',
@@ -105,9 +113,9 @@ class ArchiveSyntax:
             0x0d: b'r',
             ord('\\'): b'\\',
         }
-        self.__escape_sequences_lookup_tree = {}
-        for cp, seq in self.__escape_sequences.items():
-            branch = self.__escape_sequences_lookup_tree
+        self.__escape_seqs_lookup_tree = {}
+        for cp, seq in self.__escape_seqs.items():
+            branch = self.__escape_seqs_lookup_tree
             for seq_cp, next_seq_cp in zip(seq, (*seq[1:], None)):
                 if next_seq_cp is None:
                     branch[seq_cp] = cp
@@ -138,9 +146,6 @@ class ArchiveSyntax:
         return True
     def __hash__(self):
         return self.__hash
-    def __string_regex(self, permitted_special_chars: bytes = b'') -> bytes:
-        return (b'((' + self.string_char_regex(permitted_special_chars) + b')|(' + re.escape(self.__escape_char) +
-                b'([0abtnvfr\\]|x[0-9a-f]{2})))*')
     @functools.lru_cache()
     def string_char_regex(self, permitted_special_chars: bytes = b'') -> bytes:
         return b'[' + re.escape(self.string_chars(permitted_special_chars)) + b']'
@@ -162,6 +167,9 @@ class ArchiveSyntax:
             cp for cp in __class__.TEXT_CHARS
             if cp not in self.__special_chars or cp in permitted_special_chars
         ))
+    def __string_regex(self, permitted_special_chars: bytes = b'') -> bytes:
+        return (b'((' + self.string_char_regex(permitted_special_chars) + b')|(' + re.escape(self.__escape_char) +
+                b'(' + self.__escape_seq_regex + b')))*')
     def escape_string(self, string: bytes, permitted_special_chars: bytes = b'') -> bytes:
         """Eescape characters in ``string`` as necessary."""
         result = bytearray()
@@ -171,7 +179,7 @@ class ArchiveSyntax:
                 result.append(cp)
             else:
                 result.extend(self.escape_char)
-                result.extend(self.escape_sequences[cp])
+                result.extend(self.escape_seqs[cp])
         return bytes(result)
     def unescape_string(self, string: bytes, permitted_special_chars: bytes = b'') -> bytes:
         """Unescape characters in ``string`` as necessary.
@@ -190,7 +198,8 @@ class ArchiveSyntax:
                 continue
             cp = string[pos]
             if cp == self.escape_char[0]:
-                branch = self.escape_sequences_lookup_tree
+                pos += 1
+                branch = self.escape_seqs_lookup_tree
                 for pos in range(pos, len(string)):
                     cp = string[pos]
                     try:
@@ -206,81 +215,117 @@ class ArchiveSyntax:
                 raise ArchiveFormatError(f'invalid character in string: 0x{hex(cp)[2:].zfill(2)}')
             pos += 1
         return bytes(result)
-    def validate_path(self, path: bytes) -> bool:
-        """Validate a serialized path."""
-        path = bytes(path)
-        if not re.fullmatch(self.__path_regex, path):
-            return False
-        if path in (b'', b'.'):
-            return True
-        for comp in path.split(self.__path_sep_char):
-            try:
-                comp = self.unescape_string(comp)
-            except ArchiveFormatError:
-                return False
-            try:
-                comp = comp.decode('utf-8')
-            except UnicodeDecodeError:
-                return False
-            if comp in (b'', b'.', b'..'):
-                return False
-        return True
-    def serialize_path(self, path: str) -> bytes:
-        """Serialize an OS path.
+STANDARD_SYNTAX = ArchiveSyntax()
+
+@functools.total_ordering
+class Path:
+    __slots__ = (
+        '__comps',
+        '__valid_os_path',
+    )
+    @staticmethod
+    def deserialize(path: bytes, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX) -> 'Path':
+        """Deserialize a path in the given syntax.
 
         Raises:
-            ValueError: If the path is invalid
+            ArchiveFormatError: If the path is invalid
+        """
+        if path == '':
+            comps = ('',)
+        elif path == b'.':
+            comps = ()
+        else:
+            try:
+                comps = tuple(
+                    syntax.unescape_string(comp).decode('utf-8') for comp in bytes(path).split(syntax.path_sep_char)
+                )
+            except UnicodeError as e:
+                raise ArchiveFormatError('invalid path syntax') from e
+            for comp in comps:
+                if comp in ('', '.', '..'):
+                    raise ArchiveFormatError(f'invalid component in path: {comp!r}')
+        return __class__(comps)
+    @staticmethod
+    def validate(path: bytes, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX) -> bool:
+        try:
+            __class__.deserialize(path, syntax)
+        except ArchiveFormatError:
+            return False
+        else:
+            return True
+    @staticmethod
+    def from_ospath(path: str) -> 'Path':
+        """Convert an OS path into a ``Path``.
+
+        Raises:
+            ValueError: if the OS path is invalid as a ``Path``
         """
         path = str(path)
-        if path in ('', '.'):
-            return path.encode('utf-8')
-        path = self.__path_sep_char.join(
-            self.escape_string(comp.encode('utf-8')) for comp in path.split(_OS_PATH_SEP_CHAR)
+        if path == '':
+            comps = ('',)
+        elif path == '.':
+            comps = ()
+        else:
+            comps = path.split(_OS_PATH_SEP_CHAR)
+            if any(comp in ('', '.', '..') for comp in comps):
+                raise ValueError()
+        return __class__(comps)
+    @property
+    def comps(self) -> Tuple[str, ...]:
+        return self.__comps
+    def __init__(self, comps, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__comps = tuple(str(comp) for comp in comps)
+        assert (
+            (len(self.__comps) == 1 and self.__comps[0] == '') or
+            all(comp not in ('', '.', '..') for comp in self.__comps)
         )
-        if not self.validate_path(path):
-            raise ValueError('invalid path')
-        return path
-    def deserialize_path(self, path: bytes) -> str:
-        """Deserialize a path into an OS path.
-
-        Raises:
-            ArchiveFormatError
-            OSError: If the path was valid but cannot be used on this platform
-        """
-        path = bytes(path)
-        if path in (b'', b'.'):
-            return path.decode('utf-8')
-        if not self.validate_path(path):
-            raise ArchiveFormatError('invalid path')
-        try:
-            comps = tuple(self.unescape_string(comp).decode('utf-8') for comp in path.split(self.__path_sep_char))
-        except UnicodeError:
-            raise ArchiveFormatError('invalid path: unicode error') from None
-        if any('\x00' in comp or _OS_PATH_SEP_CHAR in comp for comp in comps):
-            raise OSError('invalid path for this platform')
-        return _OS_PATH_SEP_CHAR.join(comps)
-    def join_paths(self, *paths: bytes) -> bytes:
-        """Join serialized paths."""
-        if all(path == b'.' for path in paths):
+        self.__valid_os_path = all('\x00' not in comp and _OS_PATH_SEP_CHAR not in comp for comp in self.__comps)
+    def __eq__(self, other) -> bool:
+        if other is self:
+            return True
+        if not isinstance(other, __class__):
+            return False
+        return other.__comps == self.__comps
+    def __hash__(self) -> int:
+        return hash((__class__.__qualname__, self.__comps))
+    def __lt__(self, other) -> bool:
+        if other is self:
+            return False
+        if not isinstance(other, __class__):
+            return NotImplemented
+        return self.__comps < other.__comps
+    def __truediv__(self, other) -> 'Path':
+        if not isinstance(other, __class__) and not isinstance(other, str):
+            return NotImplemented
+        return self.join(other)
+    def __rtruediv__(self, other) -> 'Path':
+        if not isinstance(other, __class__) and not isinstance(other, str):
+            return NotImplemented
+        return __class__.join(other, self)
+    def serialize(self, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX) -> bytes:
+        if len(self.__comps) == 0:
             return b'.'
-        paths = tuple(bytes(path) for path in paths)
-        assert all(self.validate_path(path) for path in paths)
-        if len(paths) == 1:
-            return paths[0]
-        if b'' in paths:
-            raise ValueError()
-        return self.__path_sep_char.join(path for path in paths if path != b'.')
-    def split_path(self, path: bytes) -> List[bytes]:
-        if path == b'.':
-            return []
-        return path.split(self.__path_sep_char)
-    def sort_paths(self, paths: List[bytes]):
-        """Sort serialized paths in-place."""
-        paths.sort(key=self.sort_path_key)
-    def sort_path_key(self, path: bytes):
-        path = bytes(path)
-        return tuple(self.unescape_string(comp).decode('utf-8') for comp in path.split(self.__path_sep_char))
-STANDARD_SYNTAX = ArchiveSyntax()
+        return syntax.path_sep_char.join(syntax.escape_string(comp.encode('utf-8')) for comp in self.__comps)
+    def to_ospath(self) -> str:
+        if not self.__valid_os_path:
+            raise OSError('invalid path for this platform')
+        return _OS_PATH_SEP_CHAR.join(self.__comps)
+    def join(*paths: Union['Path', str]) -> 'Path':
+        comps = []
+        for path in paths:
+            if isinstance(path, __class__):
+                if len(path.comps) == 1 and path.comps[0] == '':
+                    comps.clear()
+                comps.extend(path.comps)
+            elif isinstance(path, str):
+                path = str(path)
+                if path == '':
+                    comps.clear()
+                comps.append(path)
+            else:
+                raise ValueError()
+        return __class__(comps)
 
 class RawArchive(metaclass=ABCMeta): # abstract
     @property
@@ -300,9 +345,9 @@ class RawArchiveSource(RawArchive): # abstract
         The returned iterator may raise the same exceptions as this method.
 
         Returns:
-            ``None`` if there are no records remaining, or an iterator which yields the record's path, the attribute
-            name, then zero or more ``bytes`` objects which, when concatenated together, are the serialized attribute
-            value (which may be improperly formatted)
+            ``None`` if there are no records remaining, or an iterator which yields the record's path as a
+            :class:`Path`, the attribute name as a string, then zero or more ``bytes`` objects which, when concatenated
+            together, are the serialized attribute value (which may be improperly formatted)
         Raises:
             Exception
         """
@@ -318,9 +363,9 @@ class RawArchiveSink(RawArchive): # abstract
         The provided iterator will be completely iterated over before this method returns.
 
         Args:
-            record: An iterator which yields the record's path, then the attribute name, then zero or more ``bytes``
-                    objects which, when concatenated together, are the serialized attribute value (which may be
-                    improperly formatted)
+            record: An iterator which yields the record's path as a :class:`Path`, then the attribute name as a string,
+                    then zero or more ``bytes`` objects which, when concatenated together, are the serialized attribute
+                    value (which may be improperly formatted)
         Raises:
             Exception
         """
@@ -334,6 +379,7 @@ class RawArchiveParser(RawArchiveSource): # concrete
         self.__buff_pos = 0
         self.__concurrent_reads = []
         self.__seen_comments = False
+        self.__seen_empty = False
         self.__line = 1
     def __enbuffer(self, size: int = 1) -> bool:
         """Read data from the source into the buffer.
@@ -371,14 +417,14 @@ class RawArchiveParser(RawArchiveSource): # concrete
         Raises:
             Exception: If raised by source
         """
-        return not self.__ensure()
+        return len(self.__buff) - self.__buff_pos == 0 and not self.__enbuffer()
     def __read_codepoint(self) -> int:
         """
         Raises:
             ArchiveFormatError: If at EOF or raised by source
             Exception: If raised by source
         """
-        if not self.__ensure():
+        if len(self.__buff) - self.__buff_pos == 0 and not self.__enbuffer():
             raise ArchiveFormatError('unexpected EOF')
         cp = self.__buff[self.__buff_pos]
         self.__buff_pos += 1
@@ -389,68 +435,91 @@ class RawArchiveParser(RawArchiveSource): # concrete
             ArchiveFormatError: If at EOF or raised by source
             Exception: If raised by source
         """
-        if not self.__ensure():
+        if len(self.__buff) - self.__buff_pos == 0 and not self.__enbuffer():
             raise ArchiveFormatError('unexpected EOF')
         return self.__buff[self.__buff_pos]
     def __read_codepoints(self) -> Iterator[int]:
-        while self.__ensure():
-            yield self.__read_codepoint()
+        while len(self.__buff) - self.__buff_pos != 0 or self.__enbuffer():
+            cp = self.__buff[self.__buff_pos]
+            self.__buff_pos += 1
+            yield cp
     def __peek_codepoints(self) -> Iterator[int]:
-        while self.__ensure():
-            yield self.__peek_codepoint()
+        while len(self.__buff) - self.__buff_pos != 0 or self.__enbuffer():
+            yield self.__buff[self.__buff_pos]
     def __read_string(self, permitted_special_chars: bytes = b'') -> bytes:
-        return bytes(self.__read_string_codepoints(permitted_special_chars))
-    def __read_string_codepoints(self, permitted_special_chars: bytes = b'') -> Iterator[int]:
-        lookup = self.syntax.is_string_codepoint_lookup_table(permitted_special_chars)
-        while True:
-            l = len(self.__buff)
-            while self.__buff_pos != l:
-                cp = self.__buff[self.__buff_pos]
-                if not lookup[cp]:
-                    break
-                self.__buff_pos += 1
-                yield cp
-            else:
-                if self.__ensure():
+        return b''.join(self.__read_string_blocks(permitted_special_chars))
+    def __read_string_blocks(self, permitted_special_chars: bytes = b'') -> Iterator[bytes]:
+        chars_pattern = self.syntax.string_chars_pattern(permitted_special_chars)
+        chars_lookup = self.syntax.is_string_codepoint_lookup_table(permitted_special_chars)
+        while len(self.__buff) - self.__buff_pos != 0 or self.__enbuffer():
+            chars = chars_pattern.match(self.__buff, self.__buff_pos).group(0)
+            if len(chars) != 0:
+                start = self.__buff_pos
+                self.__buff_pos += len(chars)
+                yield self.__buff[start:self.__buff_pos]
+                if self.__buff_pos == len(self.__buff):
                     continue
-                else:
-                    break
-            if cp == self.syntax.escape_char[0]:
-                self.__buff_pos += 1
-                yield self.__read_escape_sequence()
+            cp = self.__buff[self.__buff_pos]
+            if cp != self.syntax.escape_char[0]:
+                break
+            charbuff = bytearray(1)
+            if len(self.__buff) - self.__buff_pos < 2 and not self.__ensure(2):
+                raise ArchiveFormatError('unexpected EOF', line=self.__line)
+            esc_cp = self.__buff[self.__buff_pos + 1]
+            if esc_cp == ord('x'):
+                if len(self.__buff) - self.__buff_pos < 4 and not self.__ensure(4):
+                    raise ArchiveFormatError('unexpected EOF', line=self.__line)
+                hi = self.__buff[self.__buff_pos + 2]
+                lo = self.__buff[self.__buff_pos + 3]
+                try:
+                    charbuff[0] = _HEX_LOOKUP[hi][lo]
+                except KeyError:
+                    raise ArchiveFormatError('invalid escape sequence', line=self.__line) from None
+                self.__buff_pos += 4
             else:
-                break
-    def __read_escape_sequence(self) -> int:
-        branch = self.syntax.escape_sequences_lookup_tree
+                try:
+                    charbuff[0] = self.syntax.escape_seqs_lookup_tree[esc_cp]
+                except KeyError:
+                    raise ArchiveFormatError('invalid escape sequence', line=self.__line) from None
+                self.__buff_pos += 2
+            if chars_lookup[charbuff[0]]:
+                raise ArchiveFormatError('unnecessary escape', line=self.__line) from None
+            yield charbuff
+    def __read_path(self) -> 'Path':
+        comps = [self.__read_path_comp()]
+        if comps[0] == '.':
+            comps.clear()
+        elif comps[0] == '..':
+            raise ArchiveFormatError("invalid component in path: '..'", line=self.__line)
         for cp in self.__read_codepoints():
-            try:
-                branch = branch[cp]
-            except KeyError:
-                raise ArchiveFormatError('invalid escape sequence', line=self.__line)
-            if isinstance(branch, int):
-                return branch
-        raise ArchiveFormatError('unexpected EOF')
-    def __read_path(self) -> bytes:
-        comps = []
-        while True:
-            comps.append(self.__read_string())
-            if comps[-1] in (b'', '.'):
-                if len(comps) == 1:
-                    return comps[-1]
-                raise ArchiveFormatError('invalid path', line=self.__line)
-            if comps[-1] == '..':
-                raise ArchiveFormatError('invalid path', line=self.__line)
-            cp = self.__read_codepoint()
-            if cp == self.syntax.sep_char[0]:
+            if cp == self.syntax.path_sep_char[0]:
+                comp = self.__read_path_comp()
+                if comp in ('', '.', '..'):
+                    raise ArchiveFormatError(f'invalid component in path: {comp!r}', line=self.__line)
+                comps.append(comp)
+            elif cp == self.syntax.sep_char[0]:
                 break
-            elif cp != self.syntax.path_sep_char[0]:
+            else:
                 raise ArchiveFormatError('invalid path syntax', line=self.__line)
-        return self.syntax.path_sep_char.join(comps)
+        else:
+            raise ArchiveFormatError('invalid path syntax', line=self.__line)
+        if len(comps) > 1 and comps[0] == '':
+            raise ArchiveFormatError('absolute paths not permitted', line=self.__line)
+        return Path(comps)
+    def __read_path_comp(self) -> str:
+        comp = self.__read_string()
+        try:
+            return comp.decode('utf-8')
+        except UnicodeError as e:
+            raise ArchiveFormatError('invalid path component encoding', line=self.__line) from e
     def __read_name(self) -> str:
         name = self.__read_string(self.syntax.path_sep_char)
         if self.__read_codepoint() != self.syntax.sep_char[0]:
             raise ArchiveFormatError('invalid attribute name syntax', line=self.__line)
-        return name.decode('utf-8')
+        try:
+            return name.decode('utf-8')
+        except UnicodeError as e:
+            raise ArchiveFormatError('invalid attribute name encoding', line=self.__line) from e
     def __read_comment(self):
         if not self.__at_end() and self.__peek_codepoint() == self.syntax.comment_char[0]:
             self.__seen_comments = True
@@ -473,24 +542,25 @@ class RawArchiveParser(RawArchiveSource): # concrete
     def __read_record_blocks(self) -> Iterator:
         yield self.__read_path()
         yield self.__read_name()
-        yield from _util.buffered_iter(self.__read_string_codepoints(self.syntax.sep_char + self.syntax.path_sep_char),
-                source_bytes=True)
+        yield from _util.buffered_iter(self.__read_string_blocks(self.syntax.sep_char + self.syntax.path_sep_char))
         self.__read_comment()
         if self.__read_codepoint() != ord('\n'):
             raise ArchiveFormatError('expected LF at end of record', line=self.__line)
         self.__line += 1
     def __read_record_prefix(self):
-        while not self.__at_end():
-            cp = self.__peek_codepoint()
+        for cp in self.__peek_codepoints():
             if cp == ord('\n'):
-                self.__read_codepoint()
+                self.__buff_pos += 1
                 self.__line += 1
+                self.__seen_empty = True
             elif cp == self.syntax.comment_char[0]:
                 self.__read_comment()
             else:
                 break
     def seen_comments(self) -> bool:
         return self.__seen_comments
+    def seen_empty(self) -> bool:
+        return self.__seen_empty
 
 class RawArchiveComposer(RawArchiveSink): # concrete
     def __init__(self, sink: Callable[[bytes], int], *args, **kwargs):
@@ -521,7 +591,7 @@ class RawArchiveComposer(RawArchiveSink): # concrete
             name = next(record)
         except StopIteration:
             raise ValueError()
-        self.__write(path)
+        self.__write(path.serialize(self.syntax))
         self.__write(self.syntax.sep_char)
         self.__write(self.syntax.escape_string(name.encode('utf-8'), self.syntax.path_sep_char))
         self.__write(self.syntax.sep_char)
@@ -545,33 +615,27 @@ class RawArchiveComposer(RawArchiveSink): # concrete
         self.__debuffer(0)
 
 class PathMap(collections.abc.MutableMapping):
-    """This class implements a sorted mutable mapping where the keys are serialized paths for a specified syntax."""
+    """This class implements a sortable mutable mapping where the keys are :class:`Path`s."""
     __slots__ = (
-        '__syntax',
-        '__sort_key',
         '__children',
         '__len',
         '__isset',
         '__value',
     )
-    def __init__(self, init=(), *args, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX, _sort_key=None, **kwargs):
+    def __init__(self, init=(), *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not isinstance(syntax, ArchiveSyntax):
-            raise TypeError()
-        self.__syntax = syntax
-        self.__sort_key = _sort_key if _sort_key is not None else lambda key, value: self.__syntax.sort_path_key(key)
-        self.__children = _util.SortableDict(key=self.__sort_key)
+        self.__children = _util.SortableDict()
         self.__len = 0
         self.__isset = False
         for key, value in collections.OrderedDict(init).items():
             self[key] = value
-    def __getitem__(self, path: bytes) -> Any:
+    def __getitem__(self, path: 'Path') -> Any:
         for node in self.__walk(path, allow_create=False):
             pass
         if not node.__isset:
             raise KeyError()
         return node.__value
-    def __setitem__(self, path: bytes, value: Any):
+    def __setitem__(self, path: 'Path', value: Any) -> bool:
         nodes = tuple(self.__walk(path, allow_create=True))
         final = nodes[-1]
         final.__value = value
@@ -579,7 +643,10 @@ class PathMap(collections.abc.MutableMapping):
             final.__isset = True
             for node in nodes:
                 node.__len += 1
-    def __delitem__(self, path: bytes):
+            return True
+        else:
+            return False
+    def __delitem__(self, path: 'Path'):
         nodes = tuple(self.__walk(path, allow_create=False, comps=True))
         final, comp = nodes[-1]
         if not final.__isset:
@@ -591,37 +658,57 @@ class PathMap(collections.abc.MutableMapping):
         if len(nodes) > 1 and final.__len == 0:
             node, _ = nodes[-2]
             del node.__children[comp]
-    def __contains__(self, path: bytes):
+    def __contains__(self, path: 'Path'):
         try:
             self[path]
         except KeyError:
             return False
         else:
             return True
-    def __iter__(self) -> Iterator[bytes]:
+    def __iter__(self) -> Iterator['Path']:
         for comps in self.__iter_key_comps():
-            yield self.__syntax.join_paths(*comps)
+            yield Path(comps)
     def __len__(self):
         return self.__len
-    def set_and_parents(self, path: bytes, value: Any, implicit: Any) -> int:
+    def set_and_parents(self, path: 'Path', value: Any, parents: Any) -> Tuple[bool, int]:
         count = 0
         prev_nodes = []
         for node in self.__walk(path, allow_create=True):
             prev_nodes.append(node)
             if not node.__isset:
-                implied = True
+                unset = True
                 count += 1
                 node.__isset = True
-                node.__value = implicit
+                node.__value = parents
                 for n in prev_nodes:
                     n.__len += 1
             else:
-                implied = False
+                unset = False
         node.__value = value
-        if implied:
+        if unset:
             count -= 1
-        return count
-    def clear(self, path: bytes = b'.'):
+        return unset, count
+    def setdefault_and_parents(self, path: 'Path', default: Any, parents: Any) -> Tuple[bool, Any, int]:
+        count = 0
+        prev_nodes = []
+        for node in self.__walk(path, allow_create=True):
+            prev_nodes.append(node)
+            if not node.__isset:
+                unset = True
+                count += 1
+                node.__isset = True
+                node.__value = parents
+                for n in prev_nodes:
+                    n.__len += 1
+            else:
+                unset = False
+        if unset:
+            node.__value = default
+            count -= 1
+        else:
+            default = node.__value
+        return unset, default, count
+    def clear(self, path: 'Path'):
         try:
             for node in self.__walk(path, allow_create=False):
                 pass
@@ -633,7 +720,7 @@ class PathMap(collections.abc.MutableMapping):
         if node.__isset:
             node.__isset = False
             del node.__value
-    def clear_children(self, path: bytes = b'.'):
+    def clear_children(self, path: 'Path'):
         try:
             for node in self.__walk(path, allow_create=False):
                 pass
@@ -642,7 +729,7 @@ class PathMap(collections.abc.MutableMapping):
         # TODO Memory leak: empty nodes are not pruned
         node.__children.clear()
         node.__len = 1 if node.__isset else 0
-    def contains_parent(self, path: bytes) -> bool:
+    def contains_parent(self, path: 'Path') -> bool:
         try:
             for node in self.__walk(path, allow_create=False):
                 if node.__isset:
@@ -650,7 +737,7 @@ class PathMap(collections.abc.MutableMapping):
         except KeyError:
             pass
         return False
-    def contains_child(self, path: bytes) -> bool:
+    def contains_child(self, path: 'Path') -> bool:
         try:
             for node in self.__walk(path, allow_create=False):
                 if len(node) == 0:
@@ -658,40 +745,54 @@ class PathMap(collections.abc.MutableMapping):
         except KeyError:
             return False
         return len(node) > 1 or (len(node) == 1 and not node.__isset)
-    def firstitem(self) -> Tuple[bytes, Any]:
-        item = self.__firstitem()
-        if item is None:
-            raise KeyError()
-        comps, value = item
-        return self.__syntax.join_paths(*comps), value
-    def __firstitem(self) -> Optional[Tuple[List[bytes], Any]]:
+    def walkitems(self) -> Generator[Tuple['Path', Any], bool, None]:
+        gen = self.__walkitems()
+        for comps, value in gen:
+            gen.send((yield Path(comps), value))
+            yield
+    def __walkitems(self):
         if self.__isset:
-            return [], self.__value
+            # TODO Memory leak: empty nodes are not deleted
+            if (yield [], self.__value):
+                self.__isset = False
+                del self.__value
+            yield
+        for comp, node in self.__children.iteritems():
+            subwalker = node.__walkitems()
+            for subcomps, value in subwalker:
+                subcomps.insert(0, comp)
+                subwalker.send((yield subcomps, value))
+                yield
+    def setdefault(self, path: 'Path', default: Any = None):
+        nodes = tuple(self.__walk(path, allow_create=True))
+        final = nodes[-1]
+        if final.__isset:
+            return final.__value
+        else:
+            final.__isset = True
+            final.__value = default
+            for node in nodes:
+                node.__len += 1
+            return default
+    def sort(self):
         self.__children.sort()
-        for comp, node in self.__children.items():
-            item = node.__firstitem()
-            if item is None:
-                continue
-            sub_comps, value = item
-            sub_comps.insert(0, comp)
-            return sub_comps, value
-        return None
-    def __iter_key_comps(self) -> Iterator[List[bytes]]:
+        for node in self.__children.values():
+            node.sort()
+    def __iter_key_comps(self) -> Iterator[List[str]]:
         if self.__isset:
             yield []
-        self.__children.sort()
         for comp, node in self.__children.items():
             for sub_comps in node.__iter_key_comps():
                 sub_comps.insert(0, comp)
                 yield sub_comps
-    def __walk(self, path: bytes, *, allow_create: bool, comps: bool = False):
+    def __walk(self, path: Path, *, allow_create: bool, comps: bool = False):
         node = self
         yield node if not comps else (node, None)
-        for comp in self.__syntax.split_path(path):
+        for comp in path.comps:
             child = node.__children.get(comp)
             if child is None:
                 if allow_create:
-                    child = __class__(syntax=self.__syntax, _sort_key=self.__sort_key)
+                    child = __class__()
                     node.__children[comp] = child
                 else:
                     raise KeyError()
@@ -699,20 +800,22 @@ class PathMap(collections.abc.MutableMapping):
             yield node if not comps else (node, comp)
 
 class PathSet(collections.abc.MutableSet):
-    """This class implements a mutable set of serialized paths for a specified syntax."""
+    """This class implements a mutable set of :class:`Path`s."""
     @property
     def proxy(self) -> collections.abc.Set:
         return self.__elems.keys()
-    def __init__(self, init=(), *args, syntax: 'ArchiveSyntax' = STANDARD_SYNTAX, **kwargs):
+    def __init__(self, init=(), *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.__elems = PathMap(syntax=syntax)
+        self.__elems = PathMap()
         self |= init
-    def __contains__(self, path: bytes) -> bool:
+    def __contains__(self, path: 'Path') -> bool:
         return path in self.__elems
-    def __iter__(self) -> Iterator[bytes]:
+    def __iter__(self) -> Iterator['Path']:
         return iter(self.__elems)
     def __len__(self) -> int:
         return len(self.__elems)
+    def add_and_parents(self, path: 'Path') -> Tuple[bool, int]:
+        return self.__elems.set_and_parents(path, None, None)
     def clear(self, *args, **kwargs):
         return self.__elems.clear(*args, **kwargs)
     def clear_children(self, *args, **kwargs):
@@ -721,18 +824,18 @@ class PathSet(collections.abc.MutableSet):
         return self.__elems.contains_parent(*args, **kwargs)
     def contains_child(self, *args, **kwargs):
         return self.__elems.contains_child(*args, **kwargs)
-    def add(self, path: bytes):
-        self.__elems.__setitem__(path, None)
-    def discard(self, path: bytes):
+    def add(self, path: 'Path') -> bool:
+        return self.__elems.__setitem__(path, None)
+    def discard(self, path: 'Path'):
         try:
             del self.__elems[path]
         except KeyError:
             pass
-    def remove(self, path: bytes):
+    def remove(self, path: 'Path'):
         del self.__elems[path] # Possible KeyError intentional
 
 class PathMask:
-    """This class implements a mask of serialized paths for a specified syntax.
+    """This class implements a mask of :class:`Path`s.
 
     Paths may be masked recursively and non-recursively.
     """
@@ -742,27 +845,23 @@ class PathMask:
     @property
     def rmasked(self) -> collections.abc.Set:
         return self.__rmasked.proxy
-    def __init__(self, masked: Iterable[bytes] = (), rmasked: Iterable[bytes] = (), *args,
-            syntax: 'ArchiveSyntax' = STANDARD_SYNTAX, **kwargs):
+    def __init__(self, masked: Iterable['Path'] = (), rmasked: Iterable['Path'] = (), *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if not isinstance(syntax, ArchiveSyntax):
-            raise TypeError()
-        self.__syntax = syntax
         self.__rmasked = PathSet()
         for path in rmasked:
-            path = bytes(path)
-            assert self.__syntax.validate_path(path)
+            if not isinstance(path, Path):
+                raise TypeError()
             if self.__rmasked.contains_parent(path):
                 continue
             self.__rmasked.add(path)
         self.__masked = PathSet()
         for path in masked:
-            path = bytes(path)
-            assert self.__syntax.validate_path(path)
+            if not isinstance(path, Path):
+                raise TypeError()
             if self.__rmasked.contains_parent(path):
                 continue
             self.__masked.add(path)
-    def __contains__(self, path: bytes) -> bool:
-        path = bytes(path)
-        assert self.__syntax.validate_path(path)
+    def __contains__(self, path: 'Path') -> bool:
+        if not isinstance(path, Path):
+            raise TypeError()
         return path in self.__masked or self.__rmasked.contains_parent(path)

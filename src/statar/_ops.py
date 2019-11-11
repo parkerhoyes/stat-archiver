@@ -72,7 +72,7 @@ class ArchiveInfo:
     def n_files(self) -> int:
         return self.__n_paths + self.__n_implicit_dirs
     @property
-    def attrs(self) -> Tuple[str, ...]:
+    def attrs(self) -> Tuple[_attrs.Attribute, ...]:
         return self.__attrs
     def __init__(self, semantics: _sem.ArchiveSemantics, *args, n_records, n_paths, n_implicit_dirs,
             n_records_by_attr, n_paths_by_ftype, contains_comments, normalized, **kwargs):
@@ -83,16 +83,14 @@ class ArchiveInfo:
         self.__n_records = int(n_records)
         self.__n_paths = int(n_paths)
         self.__n_implicit_dirs = int(n_implicit_dirs)
+        self.__n_records_by_attr = dict(n_records_by_attr)
         self.__n_records_by_attr = types.MappingProxyType({
-            semantics.attrs[attr]: value for attr, value in dict(n_records_by_attr).items()
+            attr: self.__n_records_by_attr[attr] for attr in semantics.attrs
         })
         self.__n_paths_by_ftype = types.MappingProxyType(dict(n_paths_by_ftype))
         self.__contains_comments = bool(contains_comments)
         self.__normalized = bool(normalized)
-        self.__attrs = tuple(sorted(
-            frozenset(attr for attr, value in self.__n_records_by_attr.items() if value != 0),
-            key=self.__semantics.attrs.sort_attr_key,
-        ))
+        self.__attrs = tuple(sorted(attr for attr, value in self.__n_records_by_attr.items() if value != 0))
     def pretty(self) -> str:
         indent = ' ' * 4
         return '\n'.join((
@@ -123,9 +121,9 @@ class ArchiveInfo:
             '',
         ))
 
-def getattrs(archive: _sem.ArchiveSink, path: str, attrs: Iterable[Union[str, _attrs.Attribute]], dest_path: bytes, *,
-        recursive: bool, missing: str, exclude: Optional[_util.OSPathMask] = None, exclude_topmost: bool = False,
-        follow_symlinks: bool = False, max_depth: int = _MAX_RECURSION_DEPTH):
+def getattrs(archive: _sem.ArchiveSink, path: str, attrs: Iterable[Union[str, _attrs.Attribute]],
+        dest_path: _format.Path, *, recursive: bool, missing: str, exclude: Optional[_util.OSPathMask] = None,
+        exclude_topmost: bool = False, follow_symlinks: bool = False, max_depth: int = _MAX_RECURSION_DEPTH):
     """Recursively get the attributes ``attrs`` of all files in the directory at path ``path`` and store them in
     ``archive`` under the path ``dest_path``.
 
@@ -153,9 +151,10 @@ def getattrs(archive: _sem.ArchiveSink, path: str, attrs: Iterable[Union[str, _a
         attrs = [archive.attrs[attr] for attr in attrs]
     except KeyError as e:
         raise ValueError() from e
-    archive.attrs.sort_attrs(attrs)
-    dest_path = bytes(dest_path)
-    assert archive.syntax.validate_path(dest_path)
+    attrs.sort()
+    if not isinstance(dest_path, _format.Path):
+        raise TypeError()
+    dest_path = dest_path
     recursive = bool(recursive)
     max_depth = int(max_depth)
     if max_depth < 0:
@@ -190,7 +189,10 @@ def getattrs(archive: _sem.ArchiveSink, path: str, attrs: Iterable[Union[str, _a
             dirents = list(dirents)
         dirents.sort(key=lambda dirent: str(dirent.name))
         for dirent in dirents:
-            entry_path = archive.syntax.join_paths(dest_path, archive.syntax.serialize_path(dirent.name))
+            name = str(dirent.name)
+            if name in ('', '.', '..'):
+                raise OSError(f'invalid file name: {name!r}')
+            entry_path = dest_path / name
             getattrs(archive, dirent.path, attrs, entry_path, recursive=recursive, missing=missing, exclude=exclude,
                     follow_symlinks=follow_symlinks, max_depth=(max_depth - 1))
 
@@ -224,7 +226,7 @@ def setattrs(archive: _sem.ArchiveSource, path: str, *, missing: str, create_mis
         except StopIteration:
             raise ValueError() from None
         attr = archive.attrs[attr]
-        path = str(os.path.join(rootpath, archive.syntax.deserialize_path(source_path)))
+        path = str(os.path.join(rootpath, source_path.to_ospath()))
         if attr.small:
             value = b''.join(record)
             record = iter((value,))
@@ -248,7 +250,7 @@ def setattrs(archive: _sem.ArchiveSource, path: str, *, missing: str, create_mis
                 elif missing == 'ignore':
                     continue
                 elif missing == 'create':
-                    _create_missing(archive, path, source_path, attr, value, parents=create_missing_parents)
+                    _create_missing(archive, path, attr, value, parents=create_missing_parents)
                     info = os.lstat(path)
                 else:
                     raise ValueError()
@@ -266,7 +268,7 @@ def setattrs(archive: _sem.ArchiveSource, path: str, *, missing: str, create_mis
             dirty = _set_common_attrs(path, _util.FileInfo(info), new_info)
             info = new_info
 
-def _create_missing(path: str, source_path: bytes, attr: _attrs.Attribute, value: Any, *, parents: bool):
+def _create_missing(path: str, attr: _attrs.Attribute, value: Any, *, parents: bool):
     if attr == _attrs.ATTR_TYPE:
         assert _attrs.ATTR_TYPE.small
         ftype = value
@@ -340,10 +342,10 @@ def process(sources: Iterable[_sem.ArchiveSource], sink: _sem.ArchiveSink, *, so
                 continue
             if filter_attrs is not None and attr in filter_attrs:
                 continue
-            if attr not in buff.attrs:
-                raise ValueError()
+            assert attr in buff.attrs
             buff.write_record(itertools.chain((path, attr), record))
     if sort:
+        buff.sort()
         for record in buff.read_records():
             sink.write_record(record)
 
@@ -361,13 +363,13 @@ def inspect(parser: _format.RawArchiveParser,
     if parser.syntax != semantics.syntax:
         raise ValueError()
     n_records = 0
-    files = _format.PathMap(syntax=semantics.syntax)
+    n_paths = 0
     n_implicit_dirs = 0
     n_records_by_attr = {attr: 0 for attr in semantics.attrs}
-    ftypes = {ftype: 0 for ftype in _attrs.ATTR_TYPE.TYPES}
     normalized = True
-    prev_path_key = None
-    prev_attr_key = None
+    files = _format.PathMap()
+    prev_path = None
+    prev_attr = None
     for record in parser.read_records():
         try:
             path = next(record)
@@ -379,11 +381,10 @@ def inspect(parser: _format.RawArchiveParser,
         except KeyError:
             raise _sem.ArchiveSemanticsError(f'unrecognized attribute name {name!r}') from None
         n_records += 1
-        try:
-            ftype = files[path]
-        except KeyError:
-            ftype = ArchiveInfo.TYPE_UNKNOWN
-            n_implicit_dirs += files.set_and_parents(path, ftype, _attrs.ATTR_TYPE.TYPE_DIRECTORY)
+        new_path, ftype, implicit_parents = files.setdefault_and_parents(path, ArchiveInfo.TYPE_UNKNOWN, None)
+        if new_path:
+            n_paths += 1
+        n_implicit_dirs += implicit_parents
         if ftype == ArchiveInfo.TYPE_UNKNOWN:
             if attr == _attrs.ATTR_TYPE:
                 ftype = _attrs.ATTR_TYPE.deserialize(b''.join(record))
@@ -403,31 +404,33 @@ def inspect(parser: _format.RawArchiveParser,
             if ftype != ArchiveInfo.TYPE_UNKNOWN:
                 files[path] = ftype
         n_records_by_attr[attr] += 1
-        path_key = semantics.syntax.sort_path_key(path)
-        attr_key = semantics.attrs.sort_attr_key(name)
         if normalized and (
             attr.key != name or
-            parser.seen_comments() or (
-                prev_path_key is not None and (
-                    prev_path_key > path_key or (
-                        prev_path_key == path_key and
-                        prev_attr_key >= attr_key
+            parser.seen_comments() or
+            parser.seen_empty() or (
+                prev_path is not None and (
+                    prev_path > path or (
+                        prev_path == path and
+                        prev_attr >= attr
                     )
                 )
             )
         ): normalized = False
-        prev_path_key = path_key
-        prev_attr_key = attr_key
+        prev_path = path
+        prev_attr = attr
+    n_paths_by_ftype = {
+        ftype: 0 for ftype in (*_attrs.ATTR_TYPE.TYPES, ArchiveInfo.TYPE_UNKNOWN, ArchiveInfo.TYPE_UNRECOGNIZED)
+    }
+    for ftype in files.values():
+        if ftype is not None:
+            n_paths_by_ftype[ftype] += 1
     return ArchiveInfo(
         semantics,
         n_records=n_records,
-        n_paths=len(files),
+        n_paths=n_paths,
         n_implicit_dirs=n_implicit_dirs,
         n_records_by_attr=n_records_by_attr,
-        n_paths_by_ftype={
-            ftype: sum(1 for path, ft in files.items() if ft == ftype)
-            for ftype in (*_attrs.ATTR_TYPE.TYPES, ArchiveInfo.TYPE_UNKNOWN, ArchiveInfo.TYPE_UNRECOGNIZED)
-        },
+        n_paths_by_ftype=n_paths_by_ftype,
         contains_comments=parser.seen_comments(),
         normalized=normalized,
     )

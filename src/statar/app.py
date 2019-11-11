@@ -326,7 +326,7 @@ class Application:
         follow_symlinks = bool(args.follow_symlinks)
         prefix = str(args.prefix) if args.prefix is not None else '.'
         try:
-            prefix = _format.STANDARD_SYNTAX.serialize_path(prefix)
+            prefix = _format.Path.from_ospath(prefix)
         except ValueError:
             raise ApplicationError('invalid value for --prefix: invalid path') from None
         if args.annotate is None:
@@ -350,10 +350,10 @@ class Application:
             if not _util.issubpath(target, cwd):
                 raise ApplicationError(f'target outside CWD: {dest_path!r}')
             try:
-                dest_path = _format.STANDARD_SYNTAX.serialize_path(dest_path)
+                dest_path = _format.Path.from_ospath(dest_path)
             except ValueError:
                 raise ApplicationError(f'invalid target path: {dest_path!r}') from None
-            dest_path = _format.STANDARD_SYNTAX.join_paths(prefix, dest_path)
+            dest_path = prefix / dest_path
             target_paths[dest_path] = target
         try:
             with _get_raw_stdout() if output is None else open(output, 'wb') as output:
@@ -425,14 +425,14 @@ class Application:
         exclude = _format.PathSet()
         for path in args.exclude if args.exclude is not None else ():
             try:
-                path  = _format.STANDARD_SYNTAX.serialize_path(path)
+                path  = _format.Path.from_ospath(path)
             except ValueError as e:
                 raise ApplicationError(f'invalid path: {path!r}') from e
             exclude.add(path)
         rexclude = _format.PathSet()
         for path in args.exclude_recursive if args.exclude_recursive is not None else ():
             try:
-                path  = _format.STANDARD_SYNTAX.serialize_path(path)
+                path  = _format.Path.from_ospath(path)
             except ValueError as e:
                 raise ApplicationError(f'invalid path: {path!r}') from e
             rexclude.add(path)
