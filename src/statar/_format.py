@@ -379,6 +379,7 @@ class RawArchiveParser(RawArchiveSource): # concrete
         self.__buff_pos = 0
         self.__concurrent_reads = []
         self.__seen_comments = False
+        self.__seen_empty = False
         self.__line = 1
     def __enbuffer(self, size: int = 1) -> bool:
         """Read data from the source into the buffer.
@@ -449,6 +450,7 @@ class RawArchiveParser(RawArchiveSource): # concrete
         return b''.join(self.__read_string_blocks(permitted_special_chars))
     def __read_string_blocks(self, permitted_special_chars: bytes = b'') -> Iterator[bytes]:
         chars_pattern = self.syntax.string_chars_pattern(permitted_special_chars)
+        chars_lookup = self.syntax.is_string_codepoint_lookup_table(permitted_special_chars)
         while len(self.__buff) - self.__buff_pos != 0 or self.__enbuffer():
             chars = chars_pattern.match(self.__buff, self.__buff_pos).group(0)
             if len(chars) != 0:
@@ -480,6 +482,8 @@ class RawArchiveParser(RawArchiveSource): # concrete
                 except KeyError:
                     raise ArchiveFormatError('invalid escape sequence', line=self.__line) from None
                 self.__buff_pos += 2
+            if chars_lookup[charbuff[0]]:
+                raise ArchiveFormatError('unnecessary escape', line=self.__line) from None
             yield charbuff
     def __read_path(self) -> 'Path':
         comps = [self.__read_path_comp()]
@@ -544,17 +548,19 @@ class RawArchiveParser(RawArchiveSource): # concrete
             raise ArchiveFormatError('expected LF at end of record', line=self.__line)
         self.__line += 1
     def __read_record_prefix(self):
-        while not self.__at_end():
-            cp = self.__peek_codepoint()
+        for cp in self.__peek_codepoints():
             if cp == ord('\n'):
-                self.__read_codepoint()
+                self.__buff_pos += 1
                 self.__line += 1
+                self.__seen_empty = True
             elif cp == self.syntax.comment_char[0]:
                 self.__read_comment()
             else:
                 break
     def seen_comments(self) -> bool:
         return self.__seen_comments
+    def seen_empty(self) -> bool:
+        return self.__seen_empty
 
 class RawArchiveComposer(RawArchiveSink): # concrete
     def __init__(self, sink: Callable[[bytes], int], *args, **kwargs):

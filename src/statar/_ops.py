@@ -406,7 +406,8 @@ def inspect(parser: _format.RawArchiveParser,
         n_records_by_attr[attr] += 1
         if normalized and (
             attr.key != name or
-            parser.seen_comments() or (
+            parser.seen_comments() or
+            parser.seen_empty() or (
                 prev_path is not None and (
                     prev_path > path or (
                         prev_path == path and
