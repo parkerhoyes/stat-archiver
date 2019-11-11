@@ -174,8 +174,9 @@ class ArchiveComposer(ArchiveSink): # concrete
 class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
     """An archive that is buffered entirely in memory.
 
-    Reading from the archive always produces records in the sorted (normalized) order. Writing multiple values for the
-    same path and attribute will result in the previous value being overwritten.
+    Reading from the archive after calling :meth:`sort` without writing any new records will always produces records in
+    the sorted (normalized) order. Writing multiple values for the same path and attribute will result in the previous
+    value being overwritten.
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -188,7 +189,6 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
         if len(self.__entries) == 0:
             return None
         path, entry = self.__entries.firstitem()
-        entry.sort()
         attr, record = entry.popitem(last=False)
         if len(entry) == 0:
             del self.__entries[path]
@@ -232,6 +232,10 @@ class MemoryArchive(ArchiveSource, ArchiveSink): # concrete
         except KeyError:
             return
         yield from entry.values()
+    def sort(self):
+        self.__entries.sort()
+        for entry in self.__entries.values():
+            entry.sort()
 
 @functools.total_ordering
 class Record:

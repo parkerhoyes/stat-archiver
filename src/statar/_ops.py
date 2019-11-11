@@ -346,6 +346,7 @@ def process(sources: Iterable[_sem.ArchiveSource], sink: _sem.ArchiveSink, *, so
                 raise ValueError()
             buff.write_record(itertools.chain((path, attr), record))
     if sort:
+        buff.sort()
         for record in buff.read_records():
             sink.write_record(record)
 

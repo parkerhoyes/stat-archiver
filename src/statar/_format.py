@@ -599,7 +599,7 @@ class RawArchiveComposer(RawArchiveSink): # concrete
         self.__debuffer(0)
 
 class PathMap(collections.abc.MutableMapping):
-    """This class implements a sorted mutable mapping where the keys are :class:`Path`s."""
+    """This class implements a sortable mutable mapping where the keys are :class:`Path`s."""
     __slots__ = (
         '__children',
         '__len',
@@ -738,7 +738,6 @@ class PathMap(collections.abc.MutableMapping):
     def __firstitem(self) -> Optional[Tuple[List[str], Any]]:
         if self.__isset:
             return [], self.__value
-        self.__children.sort()
         for comp, node in self.__children.items():
             item = node.__firstitem()
             if item is None:
@@ -758,10 +757,13 @@ class PathMap(collections.abc.MutableMapping):
             for node in nodes:
                 node.__len += 1
             return default
+    def sort(self):
+        self.__children.sort()
+        for node in self.__children.values():
+            node.sort()
     def __iter_key_comps(self) -> Iterator[List[str]]:
         if self.__isset:
             yield []
-        self.__children.sort()
         for comp, node in self.__children.items():
             for sub_comps in node.__iter_key_comps():
                 sub_comps.insert(0, comp)
